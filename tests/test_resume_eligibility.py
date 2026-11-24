@@ -87,7 +87,7 @@ def test_controller_rejects_non_retryable_checkpoint_before_send_or_authorizatio
     controller = make_agent_controller(llm=llm, checkpoint_store=store)
 
     with patch("agent_controller.react_loop") as loop:
-        result = controller.run("ignored", resume_from="r-bbbb0002", interactive_llm_recovery=True)
+        result = controller.run("ignored", resume_from="r-bbbb0002", checkpoint_recovery_eligible=True)
 
     assert result.startswith("❌") and "non-retryable" in result and "(context)" in result
     loop.assert_not_called()
@@ -254,3 +254,66 @@ def test_startup_notice_leaves_legacy_file_bytes_unchanged(tmp_path):
     assert json.loads(before)["error_info"].get("retryable") is None
     assert startup_checkpoint_notice(store) is not None
     assert path.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Durable active-model resume (task 3.3)
+# ---------------------------------------------------------------------------
+
+def test_disabled_new_writes_still_resume_eligible_checkpoint_and_retire_before_send(
+    tmp_path, make_agent_controller,
+):
+    """Disabling new checkpoint writes never disables recovery of an existing file."""
+    from tests.test_active_model_resume_transport import _World, _ok
+
+    world = _World(tmp_path, make_agent_controller, "openai", _ok("openai"))
+    world.controller._checkpoint_enabled = False
+    seen: dict[str, bool] = {}
+    original = world.client._prepare_request
+
+    def prepare(payload, mode):
+        seen["on_disk_at_serialization"] = world.path.exists()
+        return original(payload, mode)
+
+    world.client._prepare_request = prepare
+    assert world.resume() == "ok"
+    assert len(world.requests) == 1
+    assert seen["on_disk_at_serialization"] is True
+    assert not world.path.exists()  # retired by the actual send under the existing owner
+    assert world.attempt is not None and world.attempt.manual_retries_used == 1
+
+
+def test_abandoned_checkpoint_stays_listed_after_the_failed_run_ends(tmp_path):
+    """No card means no expiry/deletion: an unresumed eligible file stays enumerable."""
+    import httpx
+
+    from tests.test_interactive_llm_recovery_regression import TRACE, _run
+
+    result, _llm, _executor, _progress, store = _run(tmp_path, [httpx.TimeoutException("t")])
+    assert "Use /resume to continue." in result
+    path = Path(store._checkpoint_dir) / f"{TRACE}.json"
+    saved = path.read_bytes()
+    for _ in range(2):  # repeated enumeration and startup notices never mutate it
+        assert [c["trace_id"] for c in store.list_eligible()] == [TRACE]
+        notice = startup_checkpoint_notice(store)
+        assert notice is not None and "/resume" in notice
+        assert path.read_bytes() == saved
+    owner = store.acquire_owner(TRACE)
+    assert owner is not None  # the ended run released its lease
+    owner.release()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_checkpoint_is_offered_by_resume_without_new_controls(tmp_path):
+    import httpx
+
+    from tests.test_interactive_llm_recovery_regression import _run
+
+    _result, _llm, _executor, _progress, store = _run(tmp_path, [httpx.TimeoutException("t")])
+    iface = _iface(store)
+    update, ctx = _update()
+    await cmd_resume(iface, update, ctx)
+    (text,) = _texts(update)
+    assert text.startswith("💾 Resuming: list files (step ")
+    assert iface._pending_resume == {7: "r-interactive1"}
+    assert not any("reply_markup" in call.kwargs for call in update.effective_message.reply_text.call_args_list)

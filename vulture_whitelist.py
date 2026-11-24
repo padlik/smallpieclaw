@@ -237,15 +237,10 @@ _CheckpointStoreForWhitelist
 from react_loop import LLMErrorInfo as _LLMErrorInfoForWhitelist  # noqa: E402
 _LLMErrorInfoForWhitelist
 
-from confirmation import RETRY_PREFIX as _RetryPrefixForWhitelist  # noqa: E402
-_RetryPrefixForWhitelist
-
 from confirmation import EXTEND_PREFIX as _ExtendPrefixForWhitelist  # noqa: E402
 _ExtendPrefixForWhitelist
 
 from confirmation import ConfirmationManager as _ConfirmationManagerForRetry  # noqa: E402, F811
-_ConfirmationManagerForRetry.request_retry  # type: ignore[attr-defined]
-_ConfirmationManagerForRetry.signal_retry  # type: ignore[attr-defined]
 _ConfirmationManagerForRetry.request_extension  # type: ignore[attr-defined]
 _ConfirmationManagerForRetry.signal_extension  # type: ignore[attr-defined]
 
@@ -253,8 +248,7 @@ _ConfirmationManagerForRetry.signal_extension  # type: ignore[attr-defined]
 # These symbols are intentionally not called by active code paths after removing
 # the step gate and extend Telegram callbacks.
 
-# tests/test_react_loop_error_recovery.py — lambda timeout_seconds parameter is required
-# by the patched ConfirmationManager.request_retry signature even when not used.
+# tests/test_react_loop_error_recovery.py — shared recovery test helpers imported by other suites.
 from tests.test_react_loop_error_recovery import (  # noqa: E402
     _build_context as _test_build_context,
     _checkpoint_path as _test_checkpoint_path,

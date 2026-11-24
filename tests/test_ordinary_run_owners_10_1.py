@@ -463,16 +463,15 @@ class TestOrdinaryRunOwners:
         assert w.executor._supervisor.registered == w.executor._supervisor.unregistered
         _assert_owner_released(w, "r-prepcancel")
 
-    def test_cancel_after_sent_failure_removes_new_retry_checkpoint(self, small_world):
-        """An outbound attempt makes subsequent operator cancellation in-flight cleanup."""
-        w = small_world
+    def _failing_client_with_saved_checkpoint(self, w, trace, on_request=None):
         client = w.client("B")
         requests: list[httpx.Request] = []
 
         def reject(request: httpx.Request) -> httpx.Response:
             requests.append(request)
-            # A non-transient, retryable (unknown) rejection: operator-retryable
-            # without an automatic resend; a 400 would now end terminally.
+            if on_request is not None:
+                on_request()
+            # A non-transient, retryable (unknown) rejection: no automatic resend.
             return httpx.Response(
                 409, json={"error": {"type": "conflict", "message": "conflict"}}
             )
@@ -480,25 +479,42 @@ class TestOrdinaryRunOwners:
         assert client._http is not None
         client._http.close()
         client._http = httpx.Client(transport=httpx.MockTransport(reject))
-        _save_checkpoint(w, "r-retrycancel", client.llm_cfg["id"], "resume goal")
+        _save_checkpoint(w, trace, client.llm_cfg["id"], "resume goal")
+        return client, requests
+
+    def test_sent_failure_saves_new_checkpoint_for_this_model_and_releases_owner(self, small_world):
+        """The actual send retires the old snapshot; the new failure records this model."""
+        w = small_world
+        client, requests = self._failing_client_with_saved_checkpoint(w, "r-retrycancel")
         original_checkpoint = _ckpt_bytes(w)
-        saved_on_failure: list[dict[str, bytes]] = []
-
-        def stop_at_retry_prompt(*_args, **_kwargs):
-            saved_on_failure.append(_ckpt_bytes(w))
-            w.controller.cancel()
-            return "timeout"
-
-        w.controller._confirmation.request_retry = stop_at_retry_prompt
-        w.controller.run(
+        result = w.controller.run(
             "ignored", resume_from="r-retrycancel", admitted_llm=client,
-            interactive_llm_recovery=True,
+            checkpoint_recovery_eligible=True,
         )
         assert len(requests) == 1
-        assert len(saved_on_failure) == 1 and saved_on_failure[0] != original_checkpoint
-        assert _ckpt_bytes(w) == {}
+        assert "Use /resume to continue." in result
+        after = _ckpt_bytes(w)
+        assert set(after) == set(original_checkpoint) and after != original_checkpoint
+        saved = json.loads(after["r-retrycancel.json"])
+        assert saved["model_id"] == client.llm_cfg["id"]
+        assert saved["error_info"]["retryable"] is True
         assert w.executor._supervisor.registered == w.executor._supervisor.unregistered
         _assert_owner_released(w, "r-retrycancel")
+
+    def test_cancel_during_sent_request_creates_no_new_checkpoint(self, small_world):
+        """Cancellation wins at failure handling: the retired snapshot is not resurrected."""
+        w = small_world
+        client, requests = self._failing_client_with_saved_checkpoint(
+            w, "r-sentcancel", on_request=w.controller.cancel,
+        )
+        w.controller.run(
+            "ignored", resume_from="r-sentcancel", admitted_llm=client,
+            checkpoint_recovery_eligible=True,
+        )
+        assert len(requests) == 1
+        assert _ckpt_bytes(w) == {}
+        assert w.executor._supervisor.registered == w.executor._supervisor.unregistered
+        _assert_owner_released(w, "r-sentcancel")
 
     def test_already_cancelled_external_event_starts_no_retrieval_and_preserves_checkpoint(self, tmp_path):
         event = threading.Event()

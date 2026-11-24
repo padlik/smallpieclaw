@@ -132,38 +132,26 @@ async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         logger.debug("Could not edit confirmation message: %s", exc)
 
 
+_LLM_RETRY_EXPIRED_TEXT = (
+    "⌛ These LLM error buttons have expired. "
+    "Use /resume to continue any saved progress."
+)
+
+
 @_require_cb_auth
 async def cb_llm_retry(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Retry / Cancel button presses for LLM error recovery."""
+    """Acknowledge a stale ``llm_retry:*`` button as expired and point to ``/resume``.
+
+    Live LLM Retry/Cancel cards no longer exist. Messages sent before the upgrade
+    may still carry the buttons; pressing one never starts a run, authorizes an
+    attempt, or touches a checkpoint. Authentication is enforced by the decorator.
+    """
     query = update.callback_query
-    data = query.data  # "llm_retry:{token}:retry" | "llm_retry:{token}:cancel"
-
-    # Parse: llm_retry:{token}:{response}
-    parts = data.split(":", 2)
-    token = parts[1] if len(parts) > 1 else ""
-    response = parts[2] if len(parts) > 2 else "cancel"
-
-    if response == "retry":
-        result_text = "🔄 Retrying…"
-    else:
-        result_text = "❌ Cancelled."
-
-    # Signal the agent thread via the public resume method (same pattern as
-    # cb_confirm → iface.agent.resume).
-    if iface.agent and hasattr(iface.agent, 'resume_llm_error'):
-        iface.agent.resume_llm_error(token, response)
-    else:
-        logger.warning("cb_llm_retry: agent or resume_llm_error method not available")
-
     await _ack_query(query)
-
     try:
-        await query.edit_message_text(
-            f"⚠️ <b>LLM Error</b>\n\n{result_text}",
-            parse_mode=ParseMode.HTML,
-        )
+        await query.edit_message_text(_LLM_RETRY_EXPIRED_TEXT)
     except Exception as exc:
-        logger.debug("Could not edit LLM error message: %s", exc)
+        logger.debug("Could not edit expired LLM error message: %s", exc)
 
 
 @_require_cb_auth

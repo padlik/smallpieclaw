@@ -174,7 +174,6 @@ class _ProgressPanel:
         self._drain_status: Step | None = None
         self._progress_dispatch: dict[str, Callable[[str], None]] = {
             "__CONFIRM__:": self._handle_confirm_progress,
-            "__LLM_ERROR__:": self._handle_llm_error_progress,
             "__FILE__": self._handle_file_progress,
             "__TOOL_END__:": self._handle_tool_end_progress,
             "__DRAINING__:": self._handle_drain_progress,
@@ -202,6 +201,11 @@ class _ProgressPanel:
         """
         from react_loop import _tool_icon  # local import to avoid circular at module level
 
+        if msg.startswith("Resuming with "):
+            # Model-handoff notice: checked before the content classifiers below so a
+            # model ID containing e.g. "Thinking" cannot mask the provider-handoff
+            # sentence; shown whole, neutral tag, no step increment.
+            return html.escape(msg.split("\n")[0]), None
         if "Thinking" in msg or msg.startswith("⚙️"):
             self._step_n += 1
             return "⚙️ <i>Thinking…</i>", StepTag.THINKING
@@ -332,19 +336,6 @@ class _ProgressPanel:
                 tool_name,
                 description,
                 zone_path=zone_path,
-            ),
-            self._loop,
-        )
-
-    def _handle_llm_error_progress(self, msg: str) -> None:
-        """Handle ``__LLM_ERROR__:{token}:{json}`` signals."""
-        # Format: __LLM_ERROR__:{token}:{json}
-        parts = msg.split(":", 2)
-        token = parts[1] if len(parts) > 1 else ""
-        error_json = parts[2] if len(parts) > 2 else "{}"
-        asyncio.run_coroutine_threadsafe(
-            self._interface._send_llm_error_prompt(
-                self._update.effective_message, token, error_json
             ),
             self._loop,
         )
@@ -1103,54 +1094,6 @@ class TelegramInterface:
         keyboard = InlineKeyboardMarkup(rows)
         await message.reply_text(
             f"⚠️ <b>Confirmation required</b>\n\n{_md_to_html(description)}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-        )
-
-    async def _send_llm_error_prompt(self, message, token: str, error_info_json: str) -> None:
-        """Send an inline-button error card for LLM errors with Retry/Cancel buttons."""
-        import json as _json
-        try:
-            info = _json.loads(error_info_json)
-        except _json.JSONDecodeError:
-            info = {}
-
-        error_message = info.get("message", "LLM error occurred")
-        retryable = info.get("retryable", True)
-        model = info.get("model", "?")
-        step = info.get("step", "?")
-        max_steps = info.get("max_steps")
-        if max_steps is not None:
-            step = f"{step}/{max_steps}"
-        tool_results = info.get("tool_results_count", 0)
-        detail = info.get("detail", "")
-        if len(detail) > 200:
-            detail = detail[:200] + "…"
-
-        # Build the error card
-        card = (
-            f"⚠️ <b>LLM Error</b>\n\n"
-            f"{html.escape(error_message)}\n\n"
-            f"<b>Model:</b> {html.escape(str(model))}\n"
-            f"<b>Step:</b> {step}\n"
-            f"<b>Preserved tool results:</b> {tool_results}\n"
-        )
-        if detail:
-            card += f"\n<i>{html.escape(detail)}</i>\n"
-
-        # Build inline keyboard
-        if retryable:
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Retry", callback_data=f"llm_retry:{token}:retry"),
-                InlineKeyboardButton("❌ Cancel", callback_data=f"llm_retry:{token}:cancel"),
-            ]])
-        else:
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancel", callback_data=f"llm_retry:{token}:cancel"),
-            ]])
-
-        await message.reply_text(
-            card,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )

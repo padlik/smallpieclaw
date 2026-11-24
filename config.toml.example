@@ -300,20 +300,23 @@ log_backup_count   = 30         # daily gzip-compressed, date-suffixed backups t
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM error handling
 # ─────────────────────────────────────────────────────────────────────────────
-# Controls how the agent recovers from LLM timeout/network errors.
-# When an LLM call fails after all provider retries, the agent shows an
-# inline error card with Retry/Cancel buttons and writes a checkpoint
-# to disk so the run can be resumed after a crash/restart.
+# Controls durable recovery from LLM timeout/network errors.
+# When an LLM call fails after the automatic retries, Telegram requests return
+# the failure immediately (no Retry/Cancel card, no waiting) and, if the progress
+# was saved to disk, say so: send /resume to continue it on the model that is
+# currently selected with /models (this may be a different model or provider).
 
 [llm_error_handling]
-# How long (seconds) to wait for the operator to press Retry/Cancel
-# before the agent thread unblocks and returns an error. The checkpoint
-# survives a timeout so the user can /resume later.
-retry_timeout_seconds = 120
-
-# Whether to write disk-persisted checkpoints on LLM errors.
-# When false, inline retry still works (in-memory state), but /resume
-# and crash recovery are not available.
+# Whether to write disk-persisted checkpoints on eligible LLM errors.
+# When false, a failed request cannot be resumed (there is no in-memory retry).
+# Checkpoints already on disk can still be resumed. Removing the Retry/Cancel
+# cards added no expiry or discard control: an unresumed checkpoint stays listed,
+# subject only to the existing retention cap (the 20 newest supported checkpoints
+# are kept; each new save prunes older ones). Delete any other files under
+# data/run_checkpoints/ yourself.
+#
+# The old `retry_timeout_seconds` key was removed with the Retry/Cancel cards;
+# configuration that still contains it is rejected at startup — delete the line.
 checkpoint_enabled = true
 
 # ─────────────────────────────────────────────────────────────────────────────

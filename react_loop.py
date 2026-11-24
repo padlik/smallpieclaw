@@ -328,12 +328,11 @@ class ReactContext:
     checkpoint_store: Optional[object] = None
     # Whether disk checkpoints are written (config: llm_error_handling.checkpoint_enabled)
     checkpoint_enabled: bool = True
-    # Retry prompt timeout in seconds (config: llm_error_handling.retry_timeout_seconds)
-    retry_timeout_seconds: int = 120
-    # Per-run capability: an operator can answer a Retry/Cancel prompt for this
-    # run. Never inferred from callbacks; set explicitly by the caller (Telegram
-    # root/resume). Headless runs leave it False and end LLM failures immediately.
-    interactive_llm_recovery: bool = False
+    # Per-run durable checkpoint eligibility: a retryable LLM failure may save
+    # recovery state for ``/resume``. Never inferred from callbacks; set
+    # explicitly by the caller (Telegram root/resume). Headless runs leave it
+    # False and end LLM failures without a new checkpoint.
+    checkpoint_recovery_eligible: bool = False
 
     # Native tool calling — cached tool definitions built once at loop start
     _tool_defs: Optional[list[dict]] = None
@@ -779,6 +778,72 @@ def _terminal_llm_failure(error_info: LLMErrorInfo, automatic_exhausted: bool) -
     return f"{head}. {guidance}"
 
 
+_RECOVERY_SAVED = "Saved progress is available. Use /resume to continue."
+_RECOVERY_UNAVAILABLE = (
+    "Progress could not be saved for recovery. This request cannot be resumed."
+)
+
+
+def _save_recovery_checkpoint(
+    ctx: ReactContext,
+    state: _LoopState,
+    error_info: LLMErrorInfo,
+    user_goal: str,
+) -> bool:
+    """Save eligible loop/attempt state and verify it is recoverable.
+
+    Returns True only when the store reports a successful save AND (for the
+    owner-backed production path) ``recovery_available`` rereads the exact
+    snapshot. ``OSError`` is non-fatal and reported as unavailable.
+    """
+    store = ctx.checkpoint_store
+    owner = ctx.checkpoint_owner
+    if (
+        store is not None
+        and owner is not None
+        and getattr(owner, "expected_snapshot", None) is not None
+        and hasattr(store, "recovery_available")
+    ):
+        # A resumed snapshot is still unretired (no request was sent): it stays
+        # immutable historical evidence, never replaced to record new identity.
+        return bool(store.recovery_available(ctx.trace_id, owner))
+    if store is None or not ctx.checkpoint_enabled:
+        return False
+    attempt = state.attempt_state
+    checkpoint = {
+        "trace_id": ctx.trace_id,
+        "user_goal": user_goal,
+        "messages": state.messages,
+        "step": state.step,
+        "goal_idx": state.goal_idx,
+        "max_steps": state.max_steps,
+        "json_fail_streak": state.json_fail_streak,
+        "model_id": ctx.llm.llm_cfg.get("id", ctx.llm.llm_cfg.get("model", "?")),
+        "format_version": 2,
+        "attempt_state": attempt.to_dict() if attempt is not None else None,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "error_info": {
+            "type": error_info.type,
+            "message": error_info.message,
+            "retryable": error_info.retryable,
+            "detail": error_info.detail,
+        },
+    }
+    try:
+        if ctx.checkpoint_owner is None:
+            saved = store.save(ctx.trace_id, checkpoint)
+        else:
+            saved = store.save(ctx.trace_id, checkpoint, owner=ctx.checkpoint_owner)
+        return bool(saved) and (
+            ctx.checkpoint_owner is None
+            or not hasattr(store, "recovery_available")
+            or bool(store.recovery_available(ctx.trace_id, ctx.checkpoint_owner))
+        )
+    except OSError:
+        logger.warning("Recovery checkpoint could not be written", exc_info=True)
+        return False
+
+
 def _handle_llm_error(
     ctx: ReactContext,
     state: _LoopState,
@@ -786,125 +851,36 @@ def _handle_llm_error(
     progress: Callable[[str], None],
     user_goal: str,
     automatic_exhausted: bool = False,
-) -> Optional[str]:
-    """Handle an LLM error: end it terminally or, when eligible, prompt for retry.
+) -> str:
+    """End an LLM failure: save durable recovery state when eligible, then return.
 
-    Decided before any checkpoint save, retry token or wait: cancellation wins;
-    non-retryable and headless failures return fixed guidance. Only an
-    explicitly interactive run with a retryable failure writes a checkpoint and
-    blocks on the Retry/Cancel card. ``automatic_exhausted`` is true only when
-    the automatic request budget actually ran out.
+    Cancellation wins. Non-retryable and headless failures return fixed guidance
+    and never create a checkpoint. An eligible retryable failure saves state and
+    returns truthful ``/resume`` guidance without any operator wait or card; there
+    is no memory-only continuation. ``automatic_exhausted`` is true only when the
+    automatic request budget actually ran out.
 
-    Returns None to retry (loop continues), or an error string to return.
+    Always returns an error string (never ``None``).
     """
-    import json as _json
-    import secrets as _secrets
-
+    del progress  # no live card; kept for the stable call signature
     if ctx.cancel_event.is_set():
         return "[Cancelled]"
-    if not error_info.retryable or not ctx.interactive_llm_recovery:
+    if not error_info.retryable or not ctx.checkpoint_recovery_eligible:
         return _terminal_llm_failure(error_info, automatic_exhausted)
 
-    attempt = state.attempt_state
-    checkpoint: dict | None = None
-    ctx.disk_recovery_available = False
-    # Step 1: Write checkpoint if enabled
-    if ctx.checkpoint_store is not None and ctx.checkpoint_enabled:
-        checkpoint = {
-            "trace_id": ctx.trace_id,
-            "user_goal": user_goal,
-            "messages": state.messages,
-            "step": state.step,
-            "goal_idx": state.goal_idx,
-            "max_steps": state.max_steps,
-            "json_fail_streak": state.json_fail_streak,
-            "model_id": ctx.llm.llm_cfg.get("id", ctx.llm.llm_cfg.get("model", "?")),
-            "format_version": 2,
-            "attempt_state": attempt.to_dict() if attempt is not None else None,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "error_info": {
-                "type": error_info.type,
-                "message": error_info.message,
-                "retryable": error_info.retryable,
-                "detail": error_info.detail,
-            },
-        }
-        if ctx.checkpoint_owner is None:
-            saved = ctx.checkpoint_store.save(ctx.trace_id, checkpoint)
-        else:
-            saved = ctx.checkpoint_store.save(
-                ctx.trace_id, checkpoint, owner=ctx.checkpoint_owner
-            )
-        ctx.disk_recovery_available = bool(saved) and (
-            ctx.checkpoint_owner is None
-            or not hasattr(ctx.checkpoint_store, "recovery_available")
-            or bool(ctx.checkpoint_store.recovery_available(ctx.trace_id, ctx.checkpoint_owner))
-        )
-
-    # Step 2: Prompt user for retry/cancel
-    token = _secrets.token_hex(4)
-    error_info_json = _json.dumps({
-        "type": error_info.type,
-        "message": error_info.message,
-        "retryable": error_info.retryable,
-        "detail": error_info.detail[:200],
-        "model": ctx.llm.llm_cfg.get("model", "?"),
-        "step": state.step,
-        "max_steps": state.max_steps,
-        "tool_results_count": sum(
-            1 for m in state.messages
-            if m.get("role") == "tool"
-            or m.get("role") == "user"
-            and "tool '" in m.get("content", "").lower()
-        ),
-    })
-    prompt_message = error_info_json
-    if not ctx.disk_recovery_available:
-        progress(
-            "⚠️ Disk recovery is unavailable because the checkpoint could not be saved. "
-            "A retry can continue in this session, but a process restart will not restore this request."
-        )
-    response = ctx.confirmation.request_retry(
-        token, prompt_message, progress, timeout_seconds=ctx.retry_timeout_seconds
+    ctx.disk_recovery_available = _save_recovery_checkpoint(
+        ctx, state, error_info, user_goal
     )
-
-    # Step 3: Handle response
-    if response == "retry":
-        if attempt is not None and attempt.outbound_attempts:
-            if not attempt.manual_retry_authorized:
-                attempt.authorize_manual_retry()
-            if checkpoint is not None and ctx.checkpoint_store is not None:
-                checkpoint["attempt_state"] = attempt.to_dict()
-                if ctx.checkpoint_owner is None:
-                    saved = ctx.checkpoint_store.save(ctx.trace_id, checkpoint)
-                else:
-                    saved = ctx.checkpoint_store.save(
-                        ctx.trace_id, checkpoint, owner=ctx.checkpoint_owner
-                    )
-                ctx.disk_recovery_available = bool(saved) and (
-                    ctx.checkpoint_owner is None
-                    or not hasattr(ctx.checkpoint_store, "recovery_available")
-                    or bool(ctx.checkpoint_store.recovery_available(ctx.trace_id, ctx.checkpoint_owner))
-                )
-                if not ctx.disk_recovery_available:
-                    logger.warning("Retry continuation has no verified disk recovery checkpoint")
-                    progress(
-                        "⚠️ The retry authorization could not be saved for restart recovery. "
-                        "This continuation remains available only while this run stays active."
-                    )
-        return None  # loop continues, re-calls LLM with same state
-    if response == "cancel":
-        if ctx.checkpoint_store is not None and ctx.checkpoint_enabled:
-            try:
-                if ctx.checkpoint_owner is None:
-                    ctx.checkpoint_store.delete(ctx.trace_id)
-                else:
-                    ctx.checkpoint_store.delete(ctx.trace_id, owner=ctx.checkpoint_owner)
-            except (OSError, RuntimeError):
-                logger.warning("Checkpoint cleanup was blocked; preserving recovery data")
-        return f"❌ {error_info.message}"
-    # timeout
-    return f"❌ {error_info.message}"
+    head = error_info.message
+    if not head.startswith("❌"):
+        head = f"❌ {head}"
+    parts = [f"{head}."]
+    if automatic_exhausted:
+        parts.append(_GUIDANCE_AFTER_EXHAUSTION)
+    parts.append(
+        _RECOVERY_SAVED if ctx.disk_recovery_available else _RECOVERY_UNAVAILABLE
+    )
+    return " ".join(parts)
 
 
 def _get_tool_registry_for_grouping(ctx: ReactContext):
@@ -1431,16 +1407,12 @@ def _request_turn(
                     (transient or retryable_control) and attempt.remaining_retries == 0
                 ),
             )
-            if result is None:
-                continue
             return _Turn([], "", False, result)
         except Exception as exc:
             if ctx.cancel_event.is_set():
                 return _Turn([], "", False, "[Cancelled]")
             info = _classify_llm_error(exc)
             result = _handle_llm_error(ctx, state, info, progress, _get_user_goal(state))
-            if result is None:
-                continue
             return _Turn([], "", False, result)
 
 
@@ -1676,11 +1648,9 @@ def _run_single_step(
             return _StepResult(early_return="[Cancelled]")
         except (LLMError, httpx.HTTPError) as exc:
             logger.warning("Request preparation failed at step %d: %s", state.step, _classify_llm_error(exc).type)
-            result = _handle_llm_error(
+            return _StepResult(early_return=_handle_llm_error(
                 ctx, state, _classify_llm_error(exc), progress, _get_user_goal(state),
-            )
-            if result is not None:
-                return _StepResult(early_return=result)
+            ))
 
     turn = _request_turn(
         ctx, state, system, progress,

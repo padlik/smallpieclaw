@@ -364,9 +364,8 @@ def test_checkpoint_uses_current_goal_anchor_and_resumes_native_history_unchange
     ctx.checkpoint_store = store
     ctx.checkpoint_owner = owner
     ctx.checkpoint_enabled = True
-    ctx.interactive_llm_recovery = True
+    ctx.checkpoint_recovery_eligible = True
     ctx.confirmation = ConfirmationManager()
-    ctx.confirmation.request_retry = lambda *args, **kwargs: "timeout"
     try:
         assert _get_user_goal(state) == "current task"
         _handle_llm_error(
@@ -501,3 +500,372 @@ def test_strict_resume_first_send_is_initial_attempt(tmp_path):
         assert attempt.to_dict()["max_retries"] == before["max_retries"]
     finally:
         owner.release()
+
+
+# ---------------------------------------------------------------------------
+# Active-model resume: no historical-model equality, handoff notice (tasks 2.1-2.3)
+# ---------------------------------------------------------------------------
+
+HANDOFF = (
+    "Resuming with {new}; saved progress was created with {old}. Saved conversation "
+    "and tool results will be sent to the selected model's provider."
+)
+
+
+def _active_llm(model_id: str = "b/model") -> MagicMock:
+    llm = MagicMock()
+    llm.llm_cfg = {"id": model_id, "model": "fixture"}
+    llm.set_trace_id = MagicMock()
+    return llm
+
+
+def _controller_with_counting_factory(make_agent_controller, store, model_id="b/model"):
+    admissions: list[MagicMock] = []
+
+    def factory(_event):
+        client = _active_llm(model_id)
+        admissions.append(client)
+        return client
+
+    controller = make_agent_controller(
+        llm=None, checkpoint_store=store, run_client_factory=factory,
+    )
+    return controller, admissions
+
+
+def test_resume_on_a_different_model_no_longer_requires_historical_equality(
+    tmp_path, make_agent_controller,
+):
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _resume_checkpoint()
+    checkpoint["model_id"] = "a/model"
+    assert store.save("r-strict-test", checkpoint)
+    controller, admissions = _controller_with_counting_factory(make_agent_controller, store)
+
+    with patch("agent_controller.react_loop", return_value="ok") as mock_loop:
+        assert controller.run("goal", resume_from="r-strict-test") == "ok"
+    assert len(admissions) == 1  # one admission of the active model
+    assert mock_loop.call_args.args[0].llm is admissions[0]
+    assert mock_loop.call_args.kwargs["initial_state"].messages == checkpoint["messages"]
+
+
+def test_different_model_announces_handoff_after_validation_and_before_model_io(
+    tmp_path, make_agent_controller,
+):
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _resume_checkpoint()
+    checkpoint["model_id"] = "a/model"
+    assert store.save("r-strict-test", checkpoint)
+    controller, _ = _controller_with_counting_factory(make_agent_controller, store)
+    events: list[str] = []
+
+    def loop(*_args, **_kwargs):
+        events.append("model-io")
+        return "ok"
+
+    with patch("agent_controller.react_loop", side_effect=loop):
+        controller.run("goal", events.append, resume_from="r-strict-test")
+    assert events == [HANDOFF.format(new="b/model", old="a/model"), "model-io"]
+
+
+def test_same_model_resume_has_no_handoff_notice(tmp_path, make_agent_controller):
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _resume_checkpoint()
+    checkpoint["model_id"] = "b/model"
+    assert store.save("r-strict-test", checkpoint)
+    controller, _ = _controller_with_counting_factory(make_agent_controller, store)
+    events: list[str] = []
+    with patch("agent_controller.react_loop", return_value="ok"):
+        controller.run("goal", events.append, resume_from="r-strict-test")
+    assert events == []
+
+
+def test_ordinary_non_resume_run_never_announces_a_handoff(tmp_path, make_agent_controller):
+    controller, _ = _controller_with_counting_factory(
+        make_agent_controller, CheckpointStore(str(tmp_path)),
+    )
+    events: list[str] = []
+    with patch("agent_controller.react_loop", return_value="ok"):
+        controller.run("goal", events.append)
+    assert events == []
+
+
+def test_handoff_notice_delivery_failure_does_not_readmit_replay_or_switch(
+    tmp_path, make_agent_controller,
+):
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _resume_checkpoint()
+    checkpoint["model_id"] = "a/model"
+    assert store.save("r-strict-test", checkpoint)
+    controller, admissions = _controller_with_counting_factory(make_agent_controller, store)
+
+    def broken_progress(_message: str) -> None:
+        raise RuntimeError("telegram down")
+
+    with patch("agent_controller.react_loop", return_value="ok") as mock_loop:
+        assert controller.run("goal", broken_progress, resume_from="r-strict-test") == "ok"
+    assert len(admissions) == 1  # no second admission
+    assert mock_loop.call_count == 1  # no replay
+    assert mock_loop.call_args.args[0].llm is admissions[0]  # no model switch
+
+
+def test_handoff_notice_renders_only_safe_model_identities(tmp_path, make_agent_controller):
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _resume_checkpoint()
+    checkpoint["model_id"] = "a/model\n<b>https://user:pass@host/?key=secret-token</b>"
+    assert store.save("r-strict-test", checkpoint)
+    controller, _ = _controller_with_counting_factory(make_agent_controller, store)
+    events: list[str] = []
+    with patch("agent_controller.react_loop", return_value="ok"):
+        controller.run("goal", events.append, resume_from="r-strict-test")
+    assert len(events) == 1
+    notice = events[0]
+    assert "secret-token" not in notice and "user:pass" not in notice
+    assert "\n" not in notice and "<b>" not in notice
+    assert notice.startswith("Resuming with b/model; saved progress was created with ")
+    assert notice.endswith("provider.")
+
+
+def test_resume_requires_a_valid_historical_model_string(tmp_path, make_agent_controller):
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _resume_checkpoint()
+    checkpoint["model_id"] = 42  # not a string: malformed saved identity
+    assert store.save("r-strict-test", checkpoint)
+    controller, admissions = _controller_with_counting_factory(make_agent_controller, store)
+    with patch("agent_controller.react_loop") as mock_loop:
+        result = controller.run("goal", resume_from="r-strict-test")
+    assert "Cannot resume checkpoint" in result
+    mock_loop.assert_not_called()
+
+
+def test_resume_requires_an_admitted_target_identity(tmp_path, make_agent_controller):
+    store = CheckpointStore(str(tmp_path))
+    assert store.save("r-strict-test", _resume_checkpoint())
+    llm = MagicMock()
+    llm.llm_cfg = {"model": "no-canonical-id"}
+    controller = make_agent_controller(llm=llm, checkpoint_store=store)
+    with patch("agent_controller.react_loop") as mock_loop:
+        result = controller.run("goal", resume_from="r-strict-test")
+    assert "Cannot resume checkpoint" in result
+    mock_loop.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Cross-model resume keeps ownership, exact-snapshot and cleanup guarantees (3.2)
+# ---------------------------------------------------------------------------
+
+def _cross_model_world(tmp_path, make_agent_controller, respond=None):
+    from tests.test_active_model_resume_transport import _World, _ok
+
+    return _World(tmp_path, make_agent_controller, "openai", respond or _ok("openai"))
+
+
+def test_changed_snapshot_blocks_cross_model_send_and_is_never_overwritten(
+    tmp_path, make_agent_controller,
+):
+    import json as _json
+
+    world = _cross_model_world(tmp_path, make_agent_controller)
+    real_wrapper = world._real_loop
+
+    def tamper_then_run(ctx, goal, *args, **kwargs):
+        changed = _json.loads(world.path.read_text(encoding="utf-8"))
+        changed["created_at"] = "2027-01-01T00:00:00Z"  # another actor replaced the snapshot
+        world.path.write_text(_json.dumps(changed), encoding="utf-8")
+        world.changed_bytes = world.path.read_bytes()
+        return real_wrapper(ctx, goal, *args, **kwargs)
+
+    world._real_loop = tamper_then_run
+    result = world.resume()
+    assert "no model call was sent" in result
+    assert world.requests == []  # no transport send
+    assert world.path.read_bytes() == world.changed_bytes  # never overwritten
+    owner = world.store.acquire_owner("r-resume-am1")
+    assert owner is not None
+    owner.release()
+
+
+def test_missing_snapshot_blocks_cross_model_send(tmp_path, make_agent_controller):
+    world = _cross_model_world(tmp_path, make_agent_controller)
+    real_wrapper = world._real_loop
+
+    def delete_then_run(ctx, goal, *args, **kwargs):
+        world.path.unlink()
+        return real_wrapper(ctx, goal, *args, **kwargs)
+
+    world._real_loop = delete_then_run
+    result = world.resume()
+    assert "no model call was sent" in result
+    assert world.requests == [] and not world.path.exists()
+
+
+@pytest.mark.skipif(__import__("os").geteuid() == 0, reason="permission bits do not bind root")
+def test_retirement_permission_failure_blocks_cross_model_send_and_keeps_bytes(
+    tmp_path, make_agent_controller,
+):
+    world = _cross_model_world(tmp_path, make_agent_controller)
+    directory = world.path.parent
+    directory.chmod(0o500)  # the filesystem refuses removal of the snapshot
+    try:
+        result = world.resume()
+    finally:
+        directory.chmod(0o700)
+    assert "no model call was sent" in result
+    assert world.requests == []
+    assert world.path.read_bytes() == world.saved_bytes
+    owner = world.store.acquire_owner("r-resume-am1")
+    assert owner is not None
+    owner.release()
+
+
+def test_concurrent_cross_model_resume_is_refused_before_a_second_admission(
+    tmp_path, make_agent_controller,
+):
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _resume_checkpoint()
+    checkpoint["model_id"] = "a/model"
+    assert store.save("r-strict-test", checkpoint)
+    controller, admissions = _controller_with_counting_factory(make_agent_controller, store)
+    entered, release = threading.Event(), threading.Event()
+
+    def fake_loop(ctx, *_a, **_k):
+        entered.set()
+        assert release.wait(2)
+        return "ok"
+
+    first: list[str] = []
+    with patch("agent_controller.react_loop", side_effect=fake_loop):
+        thread = threading.Thread(
+            target=lambda: first.append(controller.run("goal", resume_from="r-strict-test"))
+        )
+        thread.start()
+        assert entered.wait(2)
+        second = controller.run("goal", resume_from="r-strict-test")
+        release.set()
+        thread.join(2)
+    assert "already active" in second and first == ["ok"]
+    assert len(admissions) == 1  # the refused attempt never admitted a model
+
+
+def test_cancel_during_admission_preserves_snapshot_and_closes_owned_client(
+    tmp_path, make_agent_controller,
+):
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _resume_checkpoint()
+    checkpoint["model_id"] = "a/model"
+    assert store.save("r-strict-test", checkpoint)
+    path = tmp_path / "run_checkpoints" / "r-strict-test.json"
+    before = path.read_bytes()
+    clients: list[MagicMock] = []
+    holder: dict = {}
+
+    def factory(_event):
+        holder["controller"].cancel()  # operator stops the run while it is being admitted
+        client = _active_llm()
+        clients.append(client)
+        return client
+
+    controller = make_agent_controller(llm=None, checkpoint_store=store, run_client_factory=factory)
+    holder["controller"] = controller
+    with patch("agent_controller.react_loop") as mock_loop:
+        result = controller.run("goal", resume_from="r-strict-test")
+    assert result == "⚠️ Task stopped by operator."
+    mock_loop.assert_not_called()
+    assert path.read_bytes() == before
+    clients[0].close.assert_called_once()
+    owner = store.acquire_owner("r-strict-test")
+    assert owner is not None
+    owner.release()
+
+
+def test_setup_failure_preserves_snapshot_and_releases_owned_resources(
+    tmp_path, make_agent_controller,
+):
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _resume_checkpoint()
+    checkpoint["model_id"] = "a/model"
+    assert store.save("r-strict-test", checkpoint)
+    path = tmp_path / "run_checkpoints" / "r-strict-test.json"
+    before = path.read_bytes()
+    controller, admissions = _controller_with_counting_factory(make_agent_controller, store)
+    with patch(
+        "agent_controller.AgentRuntime.build_react_context", side_effect=RuntimeError("fixture"),
+    ):
+        with pytest.raises(RuntimeError, match="fixture"):
+            controller.run("goal", resume_from="r-strict-test")
+    assert path.read_bytes() == before
+    admissions[0].close.assert_called_once()
+    owner = store.acquire_owner("r-strict-test")
+    assert owner is not None
+    owner.release()
+
+
+# ---------------------------------------------------------------------------
+# Handoff identity rendering: canonical-ID validation + vault redaction + bound
+# ---------------------------------------------------------------------------
+
+def _handoff(saved: str, active: str, redact=None) -> str:
+    from agent_controller import _announce_model_handoff
+
+    out: list[str] = []
+    _announce_model_handoff(out.append, saved, active, redact)
+    assert len(out) == 1
+    return out[0]
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "https://user:pass@host",
+        "https://host.example/v1",
+        "provider/https://user:pass@host/v1",
+        "www.example.com/model",
+        "env:API_KEY",
+        "sec:vault_key",
+        "a/model api_key=hunter2",
+        "a/model\nsecond-line",
+    ],
+)
+def test_handoff_never_renders_endpoints_or_credential_shaped_identities(unsafe):
+    notice = _handoff(unsafe, "b/model")
+    assert "an unrecognized model" in notice
+    for leaked in ("user:pass", "://", "www.", "env:", "sec:", "hunter2", "second-line"):
+        assert leaked not in notice
+    assert notice.startswith("Resuming with b/model; saved progress was created with ")
+
+
+def test_handoff_redacts_a_vault_secret_inside_an_allowed_charset_identity():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    secret = "S3cretValue99"
+    redact = lambda text: redact_vault_secrets(text, [secret], "***REDACTED***")  # noqa: E731
+    notice = _handoff(f"a/model-{secret}", "b/model", redact)
+    assert secret not in notice and "***REDACTED***" in notice
+    assert _handoff("a/model", "b/model", redact).count("***REDACTED***") == 0
+
+
+def test_handoff_preserves_legitimate_punctuated_and_long_canonical_ids():
+    legit = "a/model(2026)"
+    assert f"created with {legit}." in _handoff(legit, "b/model")
+    unusual = "conn/vendor/Model v2 [beta] (preview)+x=1,y~z"
+    assert f"created with {unusual}." in _handoff(unusual, "b/model")
+    long_id = "conn/" + "m" * 200
+    assert f"created with {long_id}." in _handoff(long_id, "b/model")
+
+
+def test_handoff_bounds_an_oversized_identity_with_the_existing_indicator():
+    notice = _handoff("conn/" + "m" * 400, "b/model")
+    assert "..." in notice and "m" * 300 not in notice
+
+
+def test_controller_uses_its_selector_redactor_for_the_handoff(tmp_path, make_agent_controller):
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _resume_checkpoint()
+    checkpoint["model_id"] = "a/model-TOPSECRET99"
+    assert store.save("r-strict-test", checkpoint)
+    controller, _ = _controller_with_counting_factory(make_agent_controller, store)
+    controller._selector_redactor = lambda text: text.replace("TOPSECRET99", "***REDACTED***")
+    events: list[str] = []
+    with patch("agent_controller.react_loop", return_value="ok"):
+        controller.run("goal", events.append, resume_from="r-strict-test")
+    assert "TOPSECRET99" not in events[0] and "***REDACTED***" in events[0]

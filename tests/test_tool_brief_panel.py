@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import time
 import threading
+
+import pytest
 from unittest.mock import MagicMock
 
 from react_loop import fmt_tool_brief, _strip_shell_wrapper, _truncate_brief
@@ -1042,3 +1044,58 @@ class TestExtendFlowRemoved:
         from telegram_interface import TelegramInterface
         assert not hasattr(TelegramInterface, "_send_extend_prompt")
         assert not hasattr(TelegramInterface, "_handle_extend_progress")
+
+
+# ---------------------------------------------------------------------------
+# Resume model-handoff notice (durable-active-model-resume task 2.3)
+# ---------------------------------------------------------------------------
+
+
+class TestResumeHandoffNotice:
+    """The handoff notice must reach the operator whole, not cut to the 80-char fallback."""
+
+    NOTICE = (
+        "Resuming with b/model; saved progress was created with a/model. Saved "
+        "conversation and tool results will be sent to the selected model's provider."
+    )
+
+    def test_notice_is_shown_in_full_and_escaped(self) -> None:
+        panel = _make_panel()
+        panel.dispatch_progress(self.NOTICE.replace("a/model", "a/<b>model"))
+        assert len(panel._steps) == 1
+        shown = panel._steps[0].html
+        assert "selected model&#x27;s provider." in shown or "selected model's provider." in shown
+        assert "a/&lt;b&gt;model" in shown and "<b>" not in shown
+
+    def test_other_plain_progress_lines_stay_truncated(self) -> None:
+        panel = _make_panel()
+        panel.dispatch_progress("x" * 200)
+        assert len(panel._steps[0].html) <= 80
+
+    @pytest.mark.parametrize(
+        ("active", "saved"),
+        [
+            ("b/Thinking-model", "a/model"),
+            ("b/model", "a/Thinking-model"),
+            ("b/Running tool: x", "a/model"),
+            ("b/model", "a/**bold** ✅"),
+        ],
+        ids=["thinking-active", "thinking-saved", "tool-token", "result-markers"],
+    )
+    def test_notice_wins_over_generic_content_classifiers(self, active: str, saved: str) -> None:
+        notice = (
+            f"Resuming with {active}; saved progress was created with {saved}. Saved "
+            "conversation and tool results will be sent to the selected model's provider."
+        )
+        panel = _make_panel()
+        html_text, tag = panel.classify(notice)
+        assert tag is None  # neutral: neither THINKING nor TOOL_RUNNING
+        assert panel._step_n == 0  # no step increment
+        import html as _html
+
+        assert html_text == _html.escape(notice)
+        assert "provider." in html_text and "Thinking…" not in html_text
+
+        panel.dispatch_progress(notice)
+        assert len(panel._steps) == 1 and panel._steps[0].tag is None
+        assert panel._step_n == 0

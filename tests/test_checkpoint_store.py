@@ -457,3 +457,60 @@ def test_save_reports_nonfatal_disk_failure(tmp_path: Path) -> None:
     store = CheckpointStore(str(tmp_path))
     with patch("os.open", side_effect=OSError("disk full")):
         assert store.save("r-oserror-bool", _sample_state()) is False
+
+
+def test_retirement_permission_failure_blocks_and_leaves_snapshot_recoverable(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A failed unlink never counts as retired: the exact snapshot stays recoverable."""
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _supported_checkpoint()
+    assert store.save("r-owned", checkpoint)
+    owner = store.acquire_owner("r-owned")
+    assert owner is not None
+    path = tmp_path / "run_checkpoints" / "r-owned.json"
+    before = path.read_bytes()
+    try:
+        assert store.load("r-owned", owner=owner) == checkpoint
+        monkeypatch.setattr(
+            "checkpoint_store.os.remove",
+            lambda _path: (_ for _ in ()).throw(OSError("denied")),
+        )
+        result = store.retire_pending("r-owned", owner)
+        assert result.status is CheckpointRetireStatus.BLOCKED
+        assert "no model call was sent" in result.message
+        assert path.read_bytes() == before
+        assert store.recovery_available("r-owned", owner) is True
+    finally:
+        owner.release()
+
+
+def test_save_never_overwrites_a_changed_pending_snapshot(tmp_path: Path) -> None:
+    """A new failure cannot replace a snapshot another actor changed under the owner."""
+    store = CheckpointStore(str(tmp_path))
+    checkpoint = _supported_checkpoint()
+    assert store.save("r-owned", checkpoint)
+    owner = store.acquire_owner("r-owned")
+    assert owner is not None
+    path = tmp_path / "run_checkpoints" / "r-owned.json"
+    try:
+        assert store.load("r-owned", owner=owner) == checkpoint
+        path.write_text(json.dumps({**checkpoint, "step": 99}), encoding="utf-8")
+        changed = path.read_bytes()
+        assert store.save("r-owned", {**checkpoint, "step": 5}, owner=owner) is False
+        assert path.read_bytes() == changed
+        assert store.recovery_available("r-owned", owner) is False
+    finally:
+        owner.release()
+
+
+def test_second_concurrent_owner_is_refused_for_resume_traces(tmp_path: Path) -> None:
+    store = CheckpointStore(str(tmp_path))
+    assert store.save("r-owned", _supported_checkpoint())
+    first = store.acquire_owner("r-owned")
+    assert first is not None
+    try:
+        assert store.acquire_owner("r-owned") is None
+        assert store.retire_pending("r-owned").status is CheckpointRetireStatus.BLOCKED
+    finally:
+        first.release()

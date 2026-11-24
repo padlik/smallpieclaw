@@ -34,7 +34,8 @@ from conversation_io import _load_or_create_conversation_id, _save_conversation
 from embedding_client import EmbeddingClient
 from exceptions import ConfigError
 from llm_client import LLMCancelledError, LLMClient, LLMEmptyResponseError, LLMError
-from model_registry import CatalogView, ModelRegistryError, RunModel
+from model_registry import CatalogView, ModelRegistryError, RunModel, bounded_selector_evidence
+from model_settings import ModelSettingsError, _preference_selector
 from memory_store import MemoryStore, extract_tools_used, save_task_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
 from prompt_builder import estimate_tokens as _estimate_tokens
@@ -276,6 +277,46 @@ class CancelEventRegistry:
 # Agent Controller
 # ---------------------------------------------------------------------------
 
+def _safe_model_label(model_id: object, redact: Optional[Callable[[str], str]] = None) -> str:
+    """Return a model identity safe to show, never echoing unexpected content.
+
+    Reuses the established canonical-selector validation (``model_settings``:
+    rejects endpoints, ``://``, credential-shaped text, ``env:``/``sec:``
+    references and control characters, and requires a valid provider part) and
+    the established bounded, vault-redacted selector evidence. Legitimate
+    punctuation and long upstream IDs are kept (long ones are bounded).
+    """
+    try:
+        selector = _preference_selector(model_id)
+    except ModelSettingsError:
+        return "an unrecognized model"
+    return bounded_selector_evidence(selector, redact=redact)
+
+
+def _announce_model_handoff(
+    progress: Optional[Callable[[str], None]],
+    saved_model_id: str,
+    active_model_id: object,
+    redact: Optional[Callable[[str], str]] = None,
+) -> None:
+    """Tell the operator saved context moves to a different selected model.
+
+    Informational only: no approval is requested and a delivery failure is logged
+    and ignored, so it can never cause a second admission, replay or model switch.
+    """
+    if progress is None or saved_model_id == active_model_id:
+        return
+    notice = (
+        f"Resuming with {_safe_model_label(active_model_id, redact)}; saved progress was "
+        f"created with {_safe_model_label(saved_model_id, redact)}. Saved conversation and "
+        "tool results will be sent to the selected model's provider."
+    )
+    try:
+        progress(notice)
+    except Exception:  # noqa: BLE001 - notification resilience is independent of execution
+        logger.warning("Resume model-handoff notice could not be delivered", exc_info=True)
+
+
 class AgentController:
     """
     Orchestrates the ReAct loop between the user, the LLM, and the tool system.
@@ -370,7 +411,8 @@ class AgentController:
         self._confirmation = ConfirmationManager()
         self.checkpoint_store = checkpoint_store
         self._checkpoint_enabled = True
-        self._retry_timeout_seconds = 120
+        # Optional vault-secret redactor for operator-visible model identities.
+        self._selector_redactor: Optional[Callable[[str], str]] = None
         # Shared instance: the same ContextMonitor must be passed to both
         # AgentController and BuiltinExecutor so that the context_profile tool
         # reads the same monitor the ReAct loop publishes to. See ADR-0022.
@@ -482,7 +524,6 @@ class AgentController:
             confirmation=self._confirmation,
             checkpoint_store=self.checkpoint_store,
             checkpoint_enabled=self._checkpoint_enabled,
-            retry_timeout_seconds=self._retry_timeout_seconds,
             max_retries=self._agent_cfg.max_retries,
             retry_delay=self._agent_cfg.retry_delay,
             context_monitor=self.context_monitor,
@@ -505,7 +546,7 @@ class AgentController:
         resume_from: Optional[str] = None,
         milestone_notify_fn: Optional[Callable[[int], None]] = None,
         admitted_llm: Optional[LLMClient] = None,
-        interactive_llm_recovery: bool = False,
+        checkpoint_recovery_eligible: bool = False,
     ) -> str:
         """
         Process a user goal and return the final answer string.
@@ -521,10 +562,10 @@ class AgentController:
         the log context and onto the shared BuiltinExecutor for sub-agent
         tracking.
 
-        ``interactive_llm_recovery`` is the per-run capability to block on an
-        operator Retry/Cancel card for retryable LLM failures. It defaults to
-        false and is never inferred from callbacks; Telegram enables it
-        explicitly for root requests and resume.
+        ``checkpoint_recovery_eligible`` lets a retryable LLM failure save a
+        durable checkpoint for ``/resume``. It defaults to false and is never
+        inferred from callbacks; Telegram enables it explicitly for root
+        requests and resume.
 
         ``admitted_llm`` is the already-admitted client this run uses for resume
         validation, trace binding, context and cleanup; it never replaces
@@ -555,7 +596,7 @@ class AgentController:
                 milestone_notify_fn=milestone_notify_fn,
                 checkpoint_owner=checkpoint_owner,
                 admitted_llm=admitted_llm,
-                interactive_llm_recovery=interactive_llm_recovery,
+                checkpoint_recovery_eligible=checkpoint_recovery_eligible,
             )
         finally:
             if checkpoint_owner is not None:
@@ -573,7 +614,7 @@ class AgentController:
         milestone_notify_fn: Optional[Callable[[int], None]],
         checkpoint_owner: object,
         admitted_llm: Optional[LLMClient] = None,
-        interactive_llm_recovery: bool = False,
+        checkpoint_recovery_eligible: bool = False,
     ) -> str:
         """Execute a run while ``run`` owns the checkpoint trace lease.
 
@@ -630,6 +671,7 @@ class AgentController:
                     return "⚠️ Task stopped by operator."
 
             initial_state = None
+            saved_model_id: Optional[str] = None
             if resume_from is not None:
                 checkpoint = (
                     self.checkpoint_store.load(resume_from, owner=checkpoint_owner)
@@ -651,9 +693,13 @@ class AgentController:
                     }
                     if set(checkpoint) != required:
                         raise ValueError("checkpoint fields are incomplete or unknown")
-                    model_id = run_llm.llm_cfg.get("id")
-                    if not model_id or checkpoint["model_id"] != model_id:
-                        raise ValueError("checkpoint model does not match this pinned run model")
+                    # The saved model is historical evidence only: the run continues on
+                    # the newly admitted active target, so only identities are validated.
+                    active_model_id = run_llm.llm_cfg.get("id")
+                    if not isinstance(active_model_id, str) or not active_model_id:
+                        raise ValueError("this run has no valid admitted model identity")
+                    if not isinstance(checkpoint["model_id"], str) or not checkpoint["model_id"]:
+                        raise ValueError("checkpoint model identity is malformed")
                     if not isinstance(checkpoint["error_info"], dict):
                         raise ValueError("checkpoint history or error information is malformed")
                     if set(checkpoint["error_info"]) != {"type", "message", "retryable", "detail"}:
@@ -703,6 +749,7 @@ class AgentController:
                     )
                     run_trace_id = checkpoint["trace_id"]
                     user_goal = checkpoint["user_goal"]
+                    saved_model_id = checkpoint["model_id"]
                 except (ValueError, TypeError, KeyError) as exc:
                     return f"❌ Cannot resume checkpoint: {exc}. Start a new task instead."
 
@@ -732,9 +779,15 @@ class AgentController:
                 # A cancel during setup of this registered run event must survive react_loop's legacy clear().
                 ctx.owns_cancel_event = False
             ctx.checkpoint_owner = checkpoint_owner
-            ctx.interactive_llm_recovery = interactive_llm_recovery
+            ctx.checkpoint_recovery_eligible = checkpoint_recovery_eligible
             ctx.prompt_id = prompt_id
             ctx.milestone_notify_fn = milestone_notify_fn
+
+            if saved_model_id is not None:
+                _announce_model_handoff(
+                    progress_callback, saved_model_id, ctx.llm.llm_cfg.get("id", ""),
+                    self._selector_redactor,
+                )
 
             loop_kwargs: dict = {}
             if initial_state is not None:
@@ -803,13 +856,6 @@ class AgentController:
     def resume(self, token: str, confirmed: bool) -> None:
         """Called by TelegramInterface when user responds to a file_write/shell confirmation."""
         self._confirmation.signal_confirmation(token, confirmed)
-
-    def resume_llm_error(self, token: str, response: str) -> None:
-        """Called by TelegramInterface when user responds to an LLM error retry prompt.
-
-        response: "retry" | "cancel"
-        """
-        self._confirmation.signal_retry(token, response)
 
     def build_system_prompt(self, user_goal: str = "(context snapshot)") -> tuple[str, int]:
         """Build the full system prompt as it would be sent to the LLM.

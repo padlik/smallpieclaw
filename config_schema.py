@@ -506,9 +506,8 @@ class SchedulerConfig:
 
 @dataclass(frozen=True)
 class LLMErrorHandlingConfig:
-    """Configuration for LLM error recovery (inline retry, checkpoints)."""
+    """Configuration for LLM error recovery (durable checkpoints written for ``/resume``)."""
 
-    retry_timeout_seconds: int = 120
     checkpoint_enabled: bool = True
 
 
@@ -873,7 +872,6 @@ def _parse_llm_error_handling(raw: dict) -> LLMErrorHandlingConfig:
     """Parse the ``[llm_error_handling]`` section."""
     section = raw.get("llm_error_handling", {})
     return LLMErrorHandlingConfig(
-        retry_timeout_seconds=int(section.get("retry_timeout_seconds", 120)),
         checkpoint_enabled=bool(section.get("checkpoint_enabled", True)),
     )
 
@@ -1276,6 +1274,14 @@ def _reject_removed_fields(raw: dict) -> None:
                 "(XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, XDG_CACHE_HOME); "
                 "only 'workspace_dir' remains configurable in [paths]."
             )
+
+    llm_error_handling = raw.get("llm_error_handling") or {}
+    if isinstance(llm_error_handling, dict) and "retry_timeout_seconds" in llm_error_handling:
+        raise ConfigError(
+            "llm_error_handling.retry_timeout_seconds is no longer supported because "
+            "blocking Retry/Cancel cards were removed; remove the key. Failed requests "
+            "that could be saved are resumed with /resume."
+        )
 
     graph_memory = raw.get("graph_memory") or {}
     if isinstance(graph_memory, dict) and "db_path" in graph_memory:

@@ -564,7 +564,7 @@ class TestProviderContextRejection:
         assert len(wire.main_bodies) == 1  # no automatic resend, whatever the retry setting
         assert len(wire.summary_bodies) == summaries  # nothing was summarized in reaction
         # Context rejection is non-retryable: terminal guidance, no checkpoint, no card.
-        assert store.save.call_count == 0 and confirmation.request_retry.call_count == 0
+        assert store.save.call_count == 0 and confirmation.method_calls == []
         assert result.startswith("❌") and "Reduce the request or context" in result
         if summaries == 0:  # nothing was compacted, and nothing was repaired after the rejection
             assert PREFIX not in wire.main_bodies[0]
@@ -622,7 +622,6 @@ class TestDisabledRunStillValidatesSource:
         store = MagicMock()
         store.save.return_value = True
         confirmation = MagicMock()
-        confirmation.request_retry.return_value = "cancel"
         ctx = build_context(client, RecordingExecutor(), compaction_threshold_tokens=10,
                             checkpoint_store=store, checkpoint_enabled=True,
                             confirmation=confirmation)

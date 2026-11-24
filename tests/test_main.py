@@ -703,10 +703,9 @@ class TestRootStartupComposition:
             cards: list[str] = []
 
             def progress(message: str) -> None:
-                """Record an LLM error card and answer it with Cancel (no operator exists)."""
+                """Record any (obsolete) LLM error card; none may ever be published."""
                 if message.startswith("__LLM_ERROR__:"):
                     cards.append(message)
-                    root.main_controller.resume_llm_error(message.split(":", 2)[1], "cancel")
 
             outcome["reply"] = root.agent_handler(
                 1, "what is this?", progress, [str(image)], trace_id="r-0000e0a1",
@@ -741,8 +740,8 @@ class TestRootStartupComposition:
         """An exhausted transient request ends only its own run on the real loop.
 
         The root config has ``max_retries = 0``: the first request's single
-        outbound call fails with 503, the operator answers the retry card with
-        Cancel through the controller's public handler, and the run ends. A
+        outbound call fails with 503, the run ends immediately (no retry card or wait): the
+        no card is published, the run saves recovery state and returns, and a
         later independent request on the same controller and Main succeeds.
         """
         root_harness.serve_provider_chat()
@@ -773,9 +772,7 @@ class TestRootStartupComposition:
 
             def progress(message: str) -> None:
                 if message.startswith("__LLM_ERROR__:"):
-                    token = message.split(":", 2)[1]
-                    cards.append(token)
-                    root.main_controller.resume_llm_error(token, "cancel")
+                    cards.append(message)
 
             try:
                 outcome["first"] = (
@@ -796,7 +793,7 @@ class TestRootStartupComposition:
 
         first, first_exc = outcome["first"]
         assert first_exc is None and first.startswith("❌"), (first, first_exc)
-        assert len(outcome["cards"]) == 1
+        assert outcome["cards"] == []
         assert outcome["chat_after_first"] == 1, "max_retries=0 allows exactly one call"
         assert outcome["second"] == ("recovered later", None)
         assert outcome["view"].active_model_id == MAIN_ID
@@ -804,14 +801,14 @@ class TestRootStartupComposition:
         assert root.unexpected == []
 
     @pytest.mark.parametrize("resume", [False, True], ids=["ordinary", "resume"])
-    def test_production_telegram_handler_enables_interactive_llm_recovery(
+    def test_production_telegram_handler_enables_checkpoint_recovery_eligible(
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch, resume: bool,
     ) -> None:
         """The production ``agent_handler`` is what Telegram calls for requests and /resume.
 
-        A retryable provider failure must reach the operator as a Retry/Cancel card
-        (capability true) rather than ending silently; deleting the handler's
-        ``interactive_llm_recovery=True`` makes this fail. No adapter is re-created here.
+        A retryable provider failure must save durable recovery state and offer
+        ``/resume`` (eligibility true) without any card; deleting the handler's
+        ``checkpoint_recovery_eligible=True`` makes this fail. No adapter is re-created here.
         """
         root_harness.serve_provider_chat()
         served = root_harness._route
@@ -845,9 +842,7 @@ class TestRootStartupComposition:
 
             def progress(message: str) -> None:
                 if message.startswith("__LLM_ERROR__:"):
-                    token = message.split(":", 2)[1]
-                    cards.append(token)
-                    root.main_controller.resume_llm_error(token, "cancel")
+                    cards.append(message)
 
             outcome["result"] = root.agent_handler(
                 1, "do it", progress, trace_id=trace, resume_from=resume_from,
@@ -855,8 +850,9 @@ class TestRootStartupComposition:
             outcome["cards"] = cards
 
         root_harness.start(saved_default=None, write_cache=False, hold=hold)
-        assert len(outcome["cards"]) == 1, outcome
+        assert outcome["cards"] == [], outcome
         assert outcome["result"].startswith("❌")
+        assert "Saved progress is available. Use /resume to continue." in outcome["result"]
 
     def test_main_request_uses_run_local_pin_and_fresh_catalog_view(
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,

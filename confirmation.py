@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 # Marker prefixes sent to the progress callback for the Telegram UI
 CONFIRM_PREFIX = "__CONFIRM__"
 EXTEND_PREFIX = "__EXTEND__"
-RETRY_PREFIX = "__LLM_ERROR__"
 
 # Tools that can never hold standing grants (sink-side veto). Confirmations for
 # these tools are always per-operation.
@@ -191,10 +190,6 @@ class ConfirmationManager:
     2. **Step extension** — request_extension / signal_extension.  Retained
        as part of the ADR-0024 four-flow taxonomy but now dormant: the react
        loop no longer enforces a step limit, so this flow has no active callers.
-
-    3. **LLM error retry** — request_retry / signal_retry.  Prompted when an
-       LLM call fails with a retriable error so the operator can decide whether
-       to retry or cancel.
     """
 
     def __init__(self) -> None:
@@ -205,10 +200,6 @@ class ConfirmationManager:
         # --- Extension ---
         self._extend_events: dict[str, threading.Event] = {}
         self._extend_results: dict[str, str] = {}
-
-        # --- LLM error retry ---
-        self._retry_events: dict[str, threading.Event] = {}
-        self._retry_results: dict[str, str] = {}
 
         # --- Headless (sub-agent) confirmation ---
         self._headless_confirm_events: dict[str, threading.Event] = {}
@@ -333,48 +324,6 @@ class ConfirmationManager:
             event.set()
         else:
             logger.warning("signal_extension: token=%s already resolved or timed out", token[:8])
-
-    # ------------------------------------------------------------------
-    # LLM error retry
-    # ------------------------------------------------------------------
-
-    def request_retry(
-        self,
-        token: str,
-        error_info_json: str,
-        progress_cb: Callable[[str], None],
-        timeout_seconds: int = 120,
-    ) -> str:
-        """Block until the operator responds to an LLM error retry prompt.
-
-        Sends ``RETRY_PREFIX:token:error_info_json`` to *progress_cb*.
-        Returns ``'retry'``, ``'cancel'``, or ``'timeout'``.
-        """
-        event = threading.Event()
-        self._retry_events[token] = event
-        self._retry_results[token] = "timeout"
-        try:
-            progress_cb(f"{RETRY_PREFIX}:{token}:{error_info_json}")
-        except Exception:
-            self._retry_events.pop(token, None)
-            self._retry_results.pop(token, None)
-            raise
-        event.wait(timeout=timeout_seconds)
-        self._retry_events.pop(token, None)
-        return self._retry_results.pop(token, "timeout")
-
-    def signal_retry(self, token: str, response: str) -> None:
-        """Called from an external thread with the operator's retry decision.
-
-        *response* must be ``'retry'`` or ``'cancel'``.
-        Only acts if the request has not already timed out.
-        """
-        if event := self._retry_events.get(token):
-            logger.info("signal_retry: token=%s response=%s", token[:8], response)
-            self._retry_results[token] = response
-            event.set()
-        else:
-            logger.warning("signal_retry: token=%s already resolved or timed out", token[:8])
 
     # ------------------------------------------------------------------
     # Headless (sub-agent) confirmation

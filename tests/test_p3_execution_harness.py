@@ -23,7 +23,6 @@ import httpx
 import pytest
 
 from config_schema import AgentConfig, ProviderConfig, ResolvedProviderConnection
-from confirmation import RETRY_PREFIX
 from llm_client import LLMClient
 from model_registry import (
     CatalogDocument,
@@ -237,7 +236,7 @@ class TestVisionRouting:
             client, RecordingExecutor(), _VISION_GOAL, images=images,
         )
         assert result == "saw the image"
-        assert calls == [] and not [m for m in progress if m.startswith(f"{RETRY_PREFIX}:")]
+        assert calls == [] and not [m for m in progress if m.startswith("__LLM_ERROR__:")]
         assert len(vision_world.requests) == 2  # one provider call per request
         expected_url = "data:image/png;base64," + base64.b64encode(_IMAGE_BYTES).decode("ascii")
         for request in vision_world.requests:
@@ -255,7 +254,6 @@ class TestVisionRouting:
         vision_world.reject_next = True
         result, calls, progress = run_react(
             client, RecordingExecutor(), _VISION_GOAL, images=[str(vision_world.image)],
-            retry_timeout_seconds=0,
         )
         assert result.startswith("❌")
         assert calls == [] and len(vision_world.requests) == 1

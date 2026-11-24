@@ -29,7 +29,7 @@ import structlog
 import agent_controller
 import agent_logging
 from config_schema import EmbeddingsConfig, ProviderConfig, ResolvedProviderConnection
-from confirmation import RETRY_PREFIX, ConfirmationManager
+from confirmation import ConfirmationManager
 from embedding_client import EmbeddingClient
 from react_loop import ReactContext, react_loop
 from model_registry import (
@@ -474,21 +474,21 @@ def test_provider_failure_warning_and_run_lifecycle_keep_request_trace(tmp_path,
                 max_retries=0,
             )
 
-            def cancel_retry_prompt(message: str) -> None:
-                if message.startswith(f"{RETRY_PREFIX}:"):
-                    _, token, error_json = message.split(":", 2)
-                    error_card = json.loads(error_json)
-                    assert error_card["type"] == "connection"
-                    confirmation.signal_retry(token, "cancel")
+            cards: list[str] = []
+
+            def record_progress(message: str) -> None:
+                if message.startswith("__LLM_ERROR__:"):
+                    cards.append(message)
 
             with (
                 patch("react_loop._build_system_prompt", return_value=("sys", None)),
                 patch("react_loop.build_tool_definitions", return_value=[]),
             ):
-                result = react_loop(ctx, "test provider failure", cancel_retry_prompt)
+                result = react_loop(ctx, "test provider failure", record_progress)
+            assert cards == []  # no retry card is ever published
 
-            # Headless run (capability not enabled): the exhausted request ends
-            # with fixed terminal guidance instead of an operator retry card.
+            # Headless run (not checkpoint-eligible): the exhausted request ends
+            # with fixed terminal guidance and no retry card.
             assert result == (
                 "❌ 🔌 Connection failed. Automatic retries were exhausted. "
                 "Try the request again later."

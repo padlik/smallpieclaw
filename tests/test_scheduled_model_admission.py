@@ -887,29 +887,6 @@ def test_root_scheduled_failure_is_recorded_for_that_job_only_and_never_falls_ba
     assert scheduled_root.unexpected == [] and scheduled_root.open_clients_at_exit == []
 
 
-@pytest.fixture
-def canonical_loop_root(
-    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch,
-) -> RootHarness:
-    """The scheduled root with a zero retry-prompt timeout (the product's own setting value only).
-
-    ``_handle_llm_error`` waits ``ctx.retry_timeout_seconds`` for an operator retry/cancel answer that a
-    scheduled run never receives. A sub-agent controller does not inherit the root's
-    ``[llm_error_handling]`` value (it keeps its 120 s default), so the existing setting is overridden
-    here on the controller deps only; the loop, ``_request_turn`` and ``_handle_llm_error`` run unchanged.
-    """
-    import dataclasses
-
-    from agent_controller import AgentController
-
-    original = AgentController.runtime_deps
-    monkeypatch.setattr(
-        AgentController, "runtime_deps",
-        property(lambda self: dataclasses.replace(original.fget(self), retry_timeout_seconds=0)),
-    )
-    return scheduled_root
-
-
 _FINISH = "canonical-finish-8-2"
 
 
@@ -953,14 +930,14 @@ _CANONICAL_REJECTIONS = [
 
 @pytest.mark.parametrize(("selector", "predicate", "status", "provider_text", "sanitized"), _CANONICAL_REJECTIONS)
 def test_root_scheduled_provider_rejection_through_canonical_react_loop_fails_only_that_job(
-    canonical_loop_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
     selector: str, predicate: Callable[[httpx.Request], bool], status: int, provider_text: str, sanitized: str,
 ) -> None:
     """The REAL react_loop turns a provider rejection into a sanitized ``❌`` NORMAL return (no exception
     reaches the supervisor); the scheduler must still classify it as THAT job's failed run: one pinned
     attempt, no fallback to Main, run released, healthy sibling finishing through the same loop, and
     Main/preferences/TOML/settings unchanged."""
-    root = canonical_loop_root
+    root = scheduled_root
     root.serve_provider_chat()
     _finish_acme_chats(root)
     _reject_provider_requests(
@@ -1026,11 +1003,11 @@ def test_root_scheduled_provider_rejection_through_canonical_react_loop_fails_on
 
 
 def test_root_scheduled_provider_rejection_sends_one_sanitized_notice_without_main(
-    canonical_loop_root: RootHarness, monkeypatch: pytest.MonkeyPatch,
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With ``notify = true`` the canonical loop's sanitized ``❌`` normal return still produces exactly one
     failure notice for that job (no provider body text, no Main identity); one request, no second attempt."""
-    root = canonical_loop_root
+    root = scheduled_root
     root.serve_provider_chat()
     _reject_provider_requests(
         root, lambda r: _is_acme_upstream(r, "claude-zzz"),

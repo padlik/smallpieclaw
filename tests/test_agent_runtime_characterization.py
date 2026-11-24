@@ -1386,7 +1386,7 @@ class TestSubAgentProfilesStayHeadlessForLLMRecovery:
         "profile_name",
         ["ON_DEMAND_SUBAGENT", "SCHEDULED_AGENT", "PLAN_STEP_AGENT", "DIAGNOSTIC_AGENT"],
     )
-    def test_profile_run_has_no_interactive_llm_recovery(self, pin_a, profile_name):
+    def test_profile_run_has_no_checkpoint_recovery_eligible(self, pin_a, profile_name):
         from agent_runtime import RuntimeOptions, RuntimeProfile
 
         runtime = AgentRuntime(
@@ -1401,7 +1401,7 @@ class TestSubAgentProfilesStayHeadlessForLLMRecovery:
         observed: list[bool] = []
 
         def probe(ctx, *_args, **_kwargs):
-            observed.append(ctx.interactive_llm_recovery)
+            observed.append(ctx.checkpoint_recovery_eligible)
             return "ok"
 
         try:

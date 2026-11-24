@@ -68,12 +68,11 @@ class ScriptedRequestLLM:
         return self._take(self.native_script, "native")
 
 
-def _request(llm, *, retries=4, wait=None, native=False, retry_response="timeout"):
+def _request(llm, *, retries=4, wait=None, native=False):
     import threading
     from confirmation import ConfirmationManager
 
     confirmation = ConfirmationManager()
-    confirmation.request_retry = lambda *args, **kwargs: retry_response
     waits = []
 
     def fake_wait(event, delay):
@@ -254,10 +253,10 @@ def test_checkpoint_retirement_failure_blocks_before_call_or_grant_consumption(t
         owner.release()
 
 
-def test_pre_authorized_grant_is_not_stacked_after_pre_send_error(tmp_path):
+def test_failure_handling_never_authorizes_or_stacks_a_manual_grant(tmp_path):
+    """Failure handling no longer authorizes a continuation; only /resume does."""
     import threading
 
-    from confirmation import ConfirmationManager
     from react_loop import LLMErrorInfo, _handle_llm_error
 
     attempt = CallAttemptState(max_retries=0)
@@ -267,29 +266,26 @@ def test_pre_authorized_grant_is_not_stacked_after_pre_send_error(tmp_path):
         messages=[{"role": "user", "content": "goal"}], goal_idx=0,
         max_steps=8, attempt_state=attempt,
     )
-    confirmation = ConfirmationManager()
-    confirmation.request_retry = lambda *args, **kwargs: "retry"
-    llm = ScriptedRequestLLM()
     ctx = ReactContext(
-        llm=llm, tool_index=_NullToolIndex(), memory=_NullMemory(),
+        llm=ScriptedRequestLLM(), tool_index=_NullToolIndex(), memory=_NullMemory(),
         builtin_executor=None, mcp_manager=None, skill_registry=None,
-        confirmation=confirmation, cancel_event=threading.Event(), trace_id="r-grant-reuse",
-        interactive_llm_recovery=True,
+        cancel_event=threading.Event(), trace_id="r-grant-reuse",
+        checkpoint_recovery_eligible=True,
     )
 
-    assert _handle_llm_error(
+    result = _handle_llm_error(
         ctx, state, LLMErrorInfo("unknown", "failed", True, ""), lambda _message: None, "goal"
-    ) is None
+    )
+    assert isinstance(result, str) and result.startswith("❌")
     assert attempt.manual_retry_authorized is True
     assert attempt.manual_retries_used == 0
     assert attempt.automatic_retries_used == 0
 
 
-def test_failed_retry_checkpoint_save_preserves_old_file_and_authorization(tmp_path, monkeypatch):
-    import json
+def test_pre_send_failure_keeps_unretired_snapshot_byte_identical(tmp_path, monkeypatch):
+    """A retained resume snapshot is never rewritten to record new error information."""
     import threading
 
-    from confirmation import ConfirmationManager
     from react_loop import LLMErrorInfo, _handle_llm_error
 
     trace_id = "r-save-failure"
@@ -307,33 +303,31 @@ def test_failed_retry_checkpoint_save_preserves_old_file_and_authorization(tmp_p
         "created_at": "2026-01-01T00:00:00Z",
     }
     assert store.save(trace_id, old_checkpoint, owner=owner)
-    attempt.authorize_manual_retry()
     checkpoint_path = tmp_path / "run_checkpoints" / f"{trace_id}.json"
     original_file = checkpoint_path.read_bytes()
-    monkeypatch.setattr(store, "save", lambda *args, **kwargs: False)
-    confirmation = ConfirmationManager()
-    confirmation.request_retry = lambda *args, **kwargs: "retry"
+
+    def forbidden_save(*_args, **_kwargs):
+        raise AssertionError("a retained snapshot must not be rewritten before a send")
+
+    monkeypatch.setattr(store, "save", forbidden_save)
     ctx = ReactContext(
         llm=ScriptedRequestLLM(), tool_index=_NullToolIndex(), memory=_NullMemory(),
         builtin_executor=None, mcp_manager=None, skill_registry=None,
-        checkpoint_store=store, checkpoint_owner=owner, confirmation=confirmation,
+        checkpoint_store=store, checkpoint_owner=owner,
         cancel_event=threading.Event(), trace_id=trace_id,
-        interactive_llm_recovery=True,
+        checkpoint_recovery_eligible=True,
     )
     state = _LoopState(
         messages=[{"role": "user", "content": "goal"}], goal_idx=0,
         max_steps=8, attempt_state=attempt,
     )
     try:
-        assert _handle_llm_error(
+        result = _handle_llm_error(
             ctx, state, LLMErrorInfo("unknown", "failed", True, ""), lambda _message: None, "goal"
-        ) is None
+        )
+        assert "Use /resume to continue." in result  # the original is still recoverable
         assert checkpoint_path.read_bytes() == original_file
-        assert json.loads(original_file)["attempt_state"]["manual_retry_authorized"] is False
-        assert attempt.manual_retry_authorized is True
-        assert attempt.manual_retries_used == 0
-        assert attempt.remaining_retries == 0
-        assert ctx.disk_recovery_available is False
+        assert ctx.disk_recovery_available is True
     finally:
         owner.release()
 
@@ -363,13 +357,12 @@ def test_retired_grant_is_consumed_once_when_post_send_checkpoint_save_fails(
     assert store.save(trace_id, checkpoint, owner=owner)
     llm = ScriptedRequestLLM(json_script=[httpx.TimeoutException("fixture")])
     confirmation = ConfirmationManager()
-    confirmation.request_retry = lambda *args, **kwargs: "timeout"
     ctx = ReactContext(
         llm=llm, tool_index=_NullToolIndex(), memory=_NullMemory(),
         builtin_executor=None, mcp_manager=None, skill_registry=None,
         checkpoint_store=store, checkpoint_owner=owner, checkpoint_enabled=True,
         confirmation=confirmation, cancel_event=threading.Event(), trace_id=trace_id,
-        max_retries=0, interactive_llm_recovery=True,
+        max_retries=0, checkpoint_recovery_eligible=True,
     )
     state = _LoopState(
         messages=[{"role": "user", "content": "goal"}], goal_idx=0,
@@ -580,15 +573,6 @@ class _StateRecordingLLM(ScriptedLLM):
         return response
 
 
-def _no_operator_retry():
-    """Confirmation whose retry card times out at once instead of waiting."""
-    from confirmation import ConfirmationManager
-
-    confirmation = ConfirmationManager()
-    confirmation.request_retry = lambda *args, **kwargs: "timeout"
-    return confirmation
-
-
 _SHELL_ACTION = '{"action": "tool", "tool": "shell", "args": {"command": "touch marker"}}'
 _FINISH_ACTION = '{"action": "finish", "result": "done"}'
 
@@ -673,7 +657,7 @@ def test_transient_failure_after_completed_tool_turn_retries_without_replay():
     )
     waits: list[float] = []
     result, calls, _ = run_react(
-        llm, executor, "goal", max_retries=1, confirmation=_no_operator_retry(),
+        llm, executor, "goal", max_retries=1,
         retry_wait=lambda event, delay: waits.append(delay) or event.is_set(),
     )
     assert result == "done"
@@ -692,7 +676,7 @@ def test_parse_reprompt_retains_request_state_and_budget():
     llm = _StateRecordingLLM(["not json at all", httpx.TimeoutException("fixture"), _FINISH_ACTION])
     waits: list[float] = []
     result, calls, _ = run_react(
-        llm, RecordingExecutor(), "goal", confirmation=_no_operator_retry(),
+        llm, RecordingExecutor(), "goal",
         retry_wait=lambda event, delay: waits.append(delay) or event.is_set(),
     )
     assert result == "done"
@@ -769,3 +753,66 @@ def test_pre_send_cancel_preserves_mismatched_or_blocked_checkpoint(tmp_path, mo
             assert json.loads(path.read_text()) == checkpoint
     finally:
         owner.release()
+
+
+# ---------------------------------------------------------------------------
+# Durable active-model resume: single manual continuation and the send gate
+# ---------------------------------------------------------------------------
+
+def test_resumed_snapshot_is_retired_at_the_transport_send_not_at_serialization(tmp_path):
+    """Admission and wire serialization leave the snapshot; the actual send retires it."""
+    import threading
+
+    trace_id, store, owner, attempt, checkpoint = _saved_manual_resume(tmp_path)
+    path = tmp_path / "run_checkpoints" / f"{trace_id}.json"
+    seen: dict[str, bool] = {}
+
+    def handler(request):
+        seen["exists_at_send"] = path.exists()
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": '{"action":"finish"}'}}]},
+        )
+
+    client = _client(transport=httpx.MockTransport(handler))
+    original_prepare = client._prepare_request
+
+    def prepare(payload, mode):
+        seen["exists_at_serialization"] = path.exists()
+        return original_prepare(payload, mode)
+
+    client._prepare_request = prepare
+    ctx = ReactContext(
+        llm=client, tool_index=_NullToolIndex(), memory=_NullMemory(),
+        builtin_executor=None, mcp_manager=None, skill_registry=None,
+        checkpoint_store=store, checkpoint_owner=owner, checkpoint_enabled=True,
+        cancel_event=threading.Event(), trace_id=trace_id, max_retries=0,
+    )
+    state = _LoopState(
+        messages=checkpoint["messages"], goal_idx=0, max_steps=8, attempt_state=attempt,
+    )
+    assert path.exists()  # admission/restoration leave the snapshot in place
+    try:
+        turn = _request_turn(ctx, state, "system", lambda _message: None)
+        assert turn.raw == '{"action":"finish"}'
+        assert seen["exists_at_serialization"] is True
+        assert seen["exists_at_send"] is False  # retired immediately before the send
+        assert not path.exists()
+    finally:
+        client.close()
+        owner.release()
+
+
+def test_repeated_explicit_resumes_never_refill_the_automatic_budget():
+    """Each explicit resume grants one manual continuation; automatic counters only carry."""
+    attempt = CallAttemptState(max_retries=3, retry_delay=0.0)
+    attempt.begin_outbound_attempt("json")
+    attempt.begin_outbound_attempt("json")  # one automatic retry used
+    assert attempt.automatic_retries_used == 1 and attempt.remaining_retries == 2
+    for expected_manual in (1, 2):
+        restored = CallAttemptState.from_dict(attempt.to_dict())
+        restored.authorize_manual_retry()  # what the controller does on /resume
+        restored.begin_outbound_attempt("json", manual=True)
+        assert restored.manual_retries_used == expected_manual
+        assert restored.automatic_retries_used == 1 and restored.remaining_retries == 2
+        assert restored.manual_retry_authorized is False  # exactly one continuation
+        attempt = restored

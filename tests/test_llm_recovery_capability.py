@@ -31,19 +31,6 @@ from tests.test_react_loop_error_recovery import (
 PROVIDER_SECRET = "provider-secret-text-12345"
 
 
-class _RecordingConfirmation(ConfirmationManager):
-    """Records retry prompts; answers the way an operator who never replies would."""
-
-    def __init__(self, response: str = "timeout") -> None:
-        super().__init__()
-        self.retry_prompts: list[str] = []
-        self._response = response
-
-    def request_retry(self, token, prompt_message, progress_cb, timeout_seconds=120):  # type: ignore[override]
-        self.retry_prompts.append(token)
-        return self._response
-
-
 def _state() -> _LoopState:
     return _LoopState(
         messages=[{"role": "user", "content": "goal"}], goal_idx=0, max_steps=8,
@@ -60,7 +47,7 @@ def _info(kind: str, message: str, retryable: bool) -> LLMErrorInfo:
 
 def test_react_context_defaults_to_headless_recovery():
     ctx = build_context(MagicMock(), RecordingExecutor())
-    assert ctx.interactive_llm_recovery is False
+    assert ctx.checkpoint_recovery_eligible is False
 
 
 def _controller_with_ctx_probe(make_agent_controller, **run_kwargs):
@@ -70,7 +57,7 @@ def _controller_with_ctx_probe(make_agent_controller, **run_kwargs):
     observed: list[bool] = []
 
     def probe(ctx, *_a, **_k):
-        observed.append(ctx.interactive_llm_recovery)
+        observed.append(ctx.checkpoint_recovery_eligible)
         return "ok"
 
     with patch("agent_controller.react_loop", side_effect=probe):
@@ -84,7 +71,7 @@ def test_controller_run_defaults_to_headless_recovery(make_agent_controller):
 
 def test_controller_run_enables_recovery_only_when_requested(make_agent_controller):
     observed = _controller_with_ctx_probe(
-        make_agent_controller, interactive_llm_recovery=True,
+        make_agent_controller, checkpoint_recovery_eligible=True,
     )
     assert observed == [True]
 
@@ -107,14 +94,14 @@ def test_concurrent_runs_do_not_share_recovery_capability(make_agent_controller)
 
     def probe(ctx, user_goal, *_a, **_k):
         barrier.wait()  # both runs are in flight simultaneously
-        observed[user_goal] = ctx.interactive_llm_recovery
+        observed[user_goal] = ctx.checkpoint_recovery_eligible
         return "ok"
 
     with patch("agent_controller.react_loop", side_effect=probe):
         threads = [
             threading.Thread(
                 target=controller.run, args=("interactive",),
-                kwargs={"interactive_llm_recovery": True},
+                kwargs={"checkpoint_recovery_eligible": True},
             ),
             threading.Thread(target=controller.run, args=("headless",)),
         ]
@@ -143,7 +130,7 @@ RETRYABLE_KINDS = [
 def test_headless_retryable_failure_is_terminal_without_wait_token_or_checkpoint(
     tmp_path, kind, message,
 ):
-    confirmation = _RecordingConfirmation()
+    confirmation = ConfirmationManager()
     ctx = _build_context(
         tmp_path, ErrorThenSuccessLLM(RuntimeError("x"), "{}"), RecordingExecutor(),
         trace_id="r-headless", confirmation=confirmation,
@@ -152,7 +139,6 @@ def test_headless_retryable_failure_is_terminal_without_wait_token_or_checkpoint
         ctx, _state(), _info(kind, message, True), lambda _m: None, "goal",
     )
     assert isinstance(result, str) and result.startswith("❌")
-    assert confirmation.retry_prompts == []
     assert not os.path.exists(_checkpoint_path(ctx, "r-headless"))
 
 
@@ -167,19 +153,18 @@ def test_headless_retryable_failure_is_terminal_without_wait_token_or_checkpoint
 def test_nonretryable_failure_is_terminal_with_actionable_guidance(
     tmp_path, interactive, kind, message, guidance,
 ):
-    confirmation = _RecordingConfirmation()
+    confirmation = ConfirmationManager()
     ctx = _build_context(
         tmp_path, ErrorThenSuccessLLM(RuntimeError("x"), "{}"), RecordingExecutor(),
         trace_id="r-nonretry", confirmation=confirmation,
     )
-    ctx.interactive_llm_recovery = interactive
+    ctx.checkpoint_recovery_eligible = interactive
     progress: list[str] = []
     result = _handle_llm_error(
         ctx, _state(), _info(kind, message, False), progress.append, "goal",
     )
     assert result is not None and result.startswith("❌")
     assert guidance in result
-    assert confirmation.retry_prompts == []
     assert progress == []
     assert not os.path.exists(_checkpoint_path(ctx, "r-nonretry"))
 
@@ -187,7 +172,7 @@ def test_nonretryable_failure_is_terminal_with_actionable_guidance(
 def test_terminal_guidance_never_interpolates_provider_text(tmp_path):
     ctx = _build_context(
         tmp_path, ErrorThenSuccessLLM(RuntimeError("x"), "{}"), RecordingExecutor(),
-        confirmation=_RecordingConfirmation(),
+        confirmation=ConfirmationManager(),
     )
     for kind, message, retryable in [
         ("context", "📏 Context too long", False),
@@ -201,7 +186,7 @@ def test_terminal_guidance_never_interpolates_provider_text(tmp_path):
 
 
 def test_cancellation_wins_over_headless_failure_and_signal_is_kept(tmp_path):
-    confirmation = _RecordingConfirmation()
+    confirmation = ConfirmationManager()
     ctx = _build_context(
         tmp_path, ErrorThenSuccessLLM(RuntimeError("x"), "{}"), RecordingExecutor(),
         trace_id="r-cancelled", confirmation=confirmation,
@@ -213,31 +198,29 @@ def test_cancellation_wins_over_headless_failure_and_signal_is_kept(tmp_path):
     )
     assert result == "[Cancelled]"
     assert ctx.cancel_event.is_set()
-    assert confirmation.retry_prompts == []
     assert not os.path.exists(_checkpoint_path(ctx, "r-cancelled"))
 
 
 def test_cancellation_wins_over_interactive_failure_before_checkpoint(tmp_path):
-    confirmation = _RecordingConfirmation()
+    confirmation = ConfirmationManager()
     ctx = _build_context(
         tmp_path, ErrorThenSuccessLLM(RuntimeError("x"), "{}"), RecordingExecutor(),
         trace_id="r-cancelled2", confirmation=confirmation,
     )
-    ctx.interactive_llm_recovery = True
+    ctx.checkpoint_recovery_eligible = True
     ctx.cancel_event.set()
     result = _handle_llm_error(
         ctx, _state(), _info("timeout", "⏱️ Request timed out", True),
         lambda _m: None, "goal",
     )
     assert result == "[Cancelled]"
-    assert confirmation.retry_prompts == []
     assert not os.path.exists(_checkpoint_path(ctx, "r-cancelled2"))
 
 
 def test_exhaustion_is_claimed_only_when_automatic_budget_was_exhausted(tmp_path):
     ctx = _build_context(
         tmp_path, ErrorThenSuccessLLM(RuntimeError("x"), "{}"), RecordingExecutor(),
-        confirmation=_RecordingConfirmation(),
+        confirmation=ConfirmationManager(),
     )
     info = _info("timeout", "⏱️ Request timed out", True)
     exhausted = _handle_llm_error(
@@ -253,7 +236,7 @@ def test_exhaustion_is_claimed_only_when_automatic_budget_was_exhausted(tmp_path
 def test_headless_unknown_failure_does_not_claim_exhaustion(tmp_path):
     ctx = _build_context(
         tmp_path, ErrorThenSuccessLLM(RuntimeError("x"), "{}"), RecordingExecutor(),
-        confirmation=_RecordingConfirmation(),
+        confirmation=ConfirmationManager(),
     )
     result = _handle_llm_error(
         ctx, _state(), _info("unknown", "❌ LLM error: unexpected provider failure", True),
@@ -262,26 +245,60 @@ def test_headless_unknown_failure_does_not_claim_exhaustion(tmp_path):
     assert "exhausted" not in result
 
 
-def test_interactive_retryable_failure_keeps_checkpoint_and_card(tmp_path):
-    confirmation = _RecordingConfirmation("timeout")
+def test_eligible_retryable_failure_saves_and_returns_without_card_token_or_wait(tmp_path):
+    confirmation = ConfirmationManager()
     ctx = _build_context(
         tmp_path, ErrorThenSuccessLLM(RuntimeError("x"), "{}"), RecordingExecutor(),
         trace_id="r-interactive", confirmation=confirmation,
     )
-    ctx.interactive_llm_recovery = True
+    ctx.checkpoint_recovery_eligible = True
+    progress: list[str] = []
+    result = _handle_llm_error(
+        ctx, _state(), _info("timeout", "⏱️ Request timed out", True),
+        progress.append, "goal",
+    )
+    assert result is not None and result.startswith("❌ ⏱️ Request timed out")
+    assert "Saved progress is available. Use /resume to continue." in result
+    assert PROVIDER_SECRET not in result
+    assert not [m for m in progress if m.startswith("__LLM_ERROR__")]  # no card
+    assert os.path.exists(_checkpoint_path(ctx, "r-interactive"))
+
+
+def test_eligible_failure_with_writing_disabled_reports_unavailable_and_never_waits(tmp_path):
+    confirmation = ConfirmationManager()
+    ctx = _build_context(
+        tmp_path, ErrorThenSuccessLLM(RuntimeError("x"), "{}"), RecordingExecutor(),
+        trace_id="r-disabled-eligible", confirmation=confirmation, checkpoint_enabled=False,
+    )
+    ctx.checkpoint_recovery_eligible = True
     result = _handle_llm_error(
         ctx, _state(), _info("timeout", "⏱️ Request timed out", True),
         lambda _m: None, "goal",
     )
-    assert result == "❌ ⏱️ Request timed out"
-    assert len(confirmation.retry_prompts) == 1
-    assert os.path.exists(_checkpoint_path(ctx, "r-interactive"))
+    assert result is not None and result.startswith("❌")
+    assert "Progress could not be saved for recovery. This request cannot be resumed." in result
+    assert "/resume" not in result.replace("cannot be resumed", "")
+    assert not os.path.exists(_checkpoint_path(ctx, "r-disabled-eligible"))
+
+
+def test_eligible_failure_never_continues_in_memory(tmp_path):
+    """The old 'retry' answer path is gone: the handler always returns a terminal string."""
+    ctx = _build_context(
+        tmp_path, ErrorThenSuccessLLM(RuntimeError("x"), "{}"), RecordingExecutor(),
+        trace_id="r-noretry", confirmation=ConfirmationManager(),
+    )
+    ctx.checkpoint_recovery_eligible = True
+    result = _handle_llm_error(
+        ctx, _state(), _info("unknown", "❌ LLM error: unexpected provider failure", True),
+        lambda _m: None, "goal",
+    )
+    assert isinstance(result, str)
 
 
 def test_headless_loop_failure_sends_exactly_once_and_never_waits(tmp_path):
     """A real react_loop run: one outbound send, terminal ❌, no recovery data."""
     llm = ErrorThenSuccessLLM(httpx.TimeoutException("t"), '{"action":"finish","result":"x"}')
-    confirmation = _RecordingConfirmation()
+    confirmation = ConfirmationManager()
     ctx = _build_context(
         tmp_path, llm, RecordingExecutor(), trace_id="r-loopheadless",
         confirmation=confirmation,
@@ -290,7 +307,6 @@ def test_headless_loop_failure_sends_exactly_once_and_never_waits(tmp_path):
         result = react_loop(ctx, "goal", progress_callback=lambda _m: None)
     assert result.startswith("❌")
     assert llm._call_count == 1
-    assert confirmation.retry_prompts == []
     assert not os.path.exists(_checkpoint_path(ctx, "r-loopheadless"))
 
 

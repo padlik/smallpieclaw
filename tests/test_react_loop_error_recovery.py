@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from contextlib import contextmanager
 from typing import Callable, Optional
@@ -243,12 +242,12 @@ def _build_context(
     trace_id: str = "r-test1",
     checkpoint_enabled: bool = True,
     confirmation: Optional[ConfirmationManager] = None,
-    interactive_llm_recovery: bool = False,
+    checkpoint_recovery_eligible: bool = False,
 ) -> ReactContext:
     """Build a ReactContext wired for error-recovery tests (headless by default)."""
     data_dir = str(tmp_path / "data")
     return ReactContext(
-        interactive_llm_recovery=interactive_llm_recovery,
+        checkpoint_recovery_eligible=checkpoint_recovery_eligible,
         llm=llm,
         tool_index=_NullToolIndex(),
         memory=_NullMemory(),
@@ -296,9 +295,9 @@ class _StubBuiltinExecutor:
 # ---------------------------------------------------------------------------
 
 class TestHandleLLMError:
-    """Verify checkpoint write + retry/cancel/timeout branches."""
+    """Verify eligible failures save-and-return with truthful guidance."""
 
-    def test_retry_returns_none(self, tmp_path):
+    def test_eligible_retryable_saves_and_returns_resume_guidance(self, tmp_path):
         error_info = LLMErrorInfo("timeout", "⏱️ Request timed out", True, "detail")
         state = _LoopState(messages=[{"role": "user", "content": "goal"}], goal_idx=0, max_steps=8)
         ctx = _build_context(
@@ -306,54 +305,41 @@ class TestHandleLLMError:
             ErrorThenSuccessLLM(RuntimeError("nope"), '{"action": "finish", "result": "done"}'),
             RecordingExecutor(),
             trace_id="r-retry",
-            interactive_llm_recovery=True,
+            checkpoint_recovery_eligible=True,
         )
-
-        def auto_retry(*_args, **_kwargs):
-            return "retry"
-
-        ctx.confirmation.request_retry = auto_retry
-        assert _handle_llm_error(ctx, state, error_info, lambda _: None, "goal") is None
+        result = _handle_llm_error(ctx, state, error_info, lambda _: None, "goal")
+        assert result == (
+            "❌ ⏱️ Request timed out. Saved progress is available. Use /resume to continue."
+        )
         assert os.path.exists(_checkpoint_path(ctx, "r-retry"))
 
-    def test_cancel_deletes_checkpoint(self, tmp_path):
+    def test_exhaustion_guidance_precedes_resume_offer(self, tmp_path):
+        error_info = LLMErrorInfo("timeout", "⏱️ Request timed out", True, "detail")
+        state = _LoopState(messages=[{"role": "user", "content": "goal"}], goal_idx=0, max_steps=8)
+        ctx = _build_context(
+            tmp_path, ScriptedFinishLLM(), RecordingExecutor(), trace_id="r-exh",
+            checkpoint_recovery_eligible=True,
+        )
+        result = _handle_llm_error(
+            ctx, state, error_info, lambda _: None, "goal", automatic_exhausted=True,
+        )
+        assert "Automatic retries were exhausted." in result
+        assert result.endswith("Use /resume to continue.")
+
+    def test_existing_checkpoint_is_preserved_not_deleted(self, tmp_path):
+        """Failure handling never deletes (the old Cancel path is retired)."""
         error_info = LLMErrorInfo("timeout", "⏱️ Request timed out", True, "detail")
         state = _LoopState(messages=[{"role": "user", "content": "goal"}], goal_idx=0, max_steps=8)
         llm = ErrorThenSuccessLLM(RuntimeError("nope"), '{"action": "finish", "result": "done"}')
         ctx = _build_context(
-            tmp_path, llm, RecordingExecutor(), trace_id="r-cancel",
-            interactive_llm_recovery=True,
+            tmp_path, llm, RecordingExecutor(), trace_id="r-keep",
+            checkpoint_recovery_eligible=True,
         )
-        # Write a pre-existing checkpoint first.
-        if ctx.checkpoint_store is not None:
-            ctx.checkpoint_store.save("r-cancel", {"created_at": "2024-01-01T00:00:00Z"})
+        ctx.checkpoint_store.save("r-keep", {"created_at": "2024-01-01T00:00:00Z"})
+        _handle_llm_error(ctx, state, error_info, lambda _: None, "goal")
+        assert os.path.exists(_checkpoint_path(ctx, "r-keep"))
 
-        def auto_cancel(*_args, **_kwargs):
-            return "cancel"
-
-        ctx.confirmation.request_retry = auto_cancel
-        result = _handle_llm_error(ctx, state, error_info, lambda _: None, "goal")
-        assert result == "❌ ⏱️ Request timed out"
-        assert not os.path.exists(_checkpoint_path(ctx, "r-cancel"))
-
-    def test_timeout_preserves_checkpoint(self, tmp_path):
-        error_info = LLMErrorInfo("timeout", "⏱️ Request timed out", True, "detail")
-        state = _LoopState(messages=[{"role": "user", "content": "goal"}], goal_idx=0, max_steps=8)
-        llm = ErrorThenSuccessLLM(RuntimeError("nope"), '{"action": "finish", "result": "done"}')
-        ctx = _build_context(
-            tmp_path, llm, RecordingExecutor(), trace_id="r-timeout",
-            interactive_llm_recovery=True,
-        )
-
-        def auto_timeout(*_args, **_kwargs):
-            return "timeout"
-
-        ctx.confirmation.request_retry = auto_timeout
-        result = _handle_llm_error(ctx, state, error_info, lambda _: None, "goal")
-        assert result == "❌ ⏱️ Request timed out"
-        assert os.path.exists(_checkpoint_path(ctx, "r-timeout"))
-
-    def test_checkpoint_disabled_does_not_write(self, tmp_path):
+    def test_checkpoint_disabled_does_not_write_and_reports_unavailable(self, tmp_path):
         error_info = LLMErrorInfo("timeout", "⏱️ Request timed out", True, "detail")
         state = _LoopState(messages=[{"role": "user", "content": "goal"}], goal_idx=0, max_steps=8)
         llm = ErrorThenSuccessLLM(RuntimeError("nope"), '{"action": "finish", "result": "done"}')
@@ -363,130 +349,55 @@ class TestHandleLLMError:
             RecordingExecutor(),
             trace_id="r-disabled",
             checkpoint_enabled=False,
-            interactive_llm_recovery=True,
+            checkpoint_recovery_eligible=True,
         )
-
-        def auto_retry(*_args, **_kwargs):
-            return "retry"
-
-        ctx.confirmation.request_retry = auto_retry
-        assert _handle_llm_error(ctx, state, error_info, lambda _: None, "goal") is None
+        result = _handle_llm_error(ctx, state, error_info, lambda _: None, "goal")
+        assert "cannot be resumed" in result
         assert not os.path.exists(_checkpoint_path(ctx, "r-disabled"))
 
 
 # ---------------------------------------------------------------------------
-# Integration tests: react_loop error recovery
+# Integration tests: react_loop failure handling
 # ---------------------------------------------------------------------------
 
 class TestReactLoopErrorRecovery:
-    """End-to-end react_loop recovery via inline retry."""
+    """End-to-end react_loop immediate durable-only outcomes."""
 
-    def test_retry_then_success(self, tmp_path):
-        error = httpx.TimeoutException("timed out")
-        success = '{"action": "finish", "result": "recovered"}'
-        llm = ErrorThenSuccessLLM(error, success)
-        executor = RecordingExecutor()
-        confirmation = ConfirmationManager()
-
-        def request_retry(token, error_info_json, progress_cb, timeout_seconds=120):
-            # Capture the marker first, then signal retry.
-            progress_cb(f"__LLM_ERROR__:{token}:{error_info_json}")
-            confirmation.signal_retry(token, "retry")
-            return "retry"
-
-        confirmation.request_retry = request_retry  # type: ignore[method-assign]
-
+    def test_eligible_failure_returns_immediately_with_checkpoint(self, tmp_path):
+        llm = ErrorThenSuccessLLM(
+            httpx.TimeoutException("timed out"), '{"action": "finish", "result": "recovered"}',
+        )
         result, ctx, progress = _run_with_system(
-            llm, executor, tmp_path,
-            trace_id="r-recover",
-            confirmation=confirmation,
-            interactive_llm_recovery=True,
+            llm, RecordingExecutor(), tmp_path,
+            trace_id="r-preserved", checkpoint_recovery_eligible=True,
         )
-
-        assert result == "recovered"
-        assert llm._call_count == 2
-        assert os.path.exists(_checkpoint_path(ctx, "r-recover")) is False
-        # Verify the error card marker was emitted.
-        assert any("__LLM_ERROR__" in p for p in progress)
-        # The user-facing message is in the error_info JSON inside the marker;
-        # the marker itself contains the message text.
-        assert any("Request timed out" in p for p in progress)
-
-    def test_cancel_returns_error(self, tmp_path):
-        error = httpx.TimeoutException("timed out")
-        success = '{"action": "finish", "result": "recovered"}'
-        llm = ErrorThenSuccessLLM(error, success)
-        executor = RecordingExecutor()
-        confirmation = ConfirmationManager()
-
-        def request_retry(token, error_info_json, progress_cb, timeout_seconds=120):
-            progress_cb(f"__LLM_ERROR__:{token}:{error_info_json}")
-            confirmation.signal_retry(token, "cancel")
-            return "cancel"
-
-        confirmation.request_retry = request_retry  # type: ignore[method-assign]
-
-        result, ctx, _ = _run_with_system(
-            llm, executor, tmp_path,
-            trace_id="r-cancel",
-            confirmation=confirmation,
-            interactive_llm_recovery=True,
-        )
-
-        assert result.startswith("❌")
-        assert llm._call_count == 1
-        assert not os.path.exists(_checkpoint_path(ctx, "r-cancel"))
-
-    def test_retry_timeout_preserves_checkpoint(self, tmp_path):
-        error = httpx.TimeoutException("timed out")
-        success = '{"action": "finish", "result": "recovered"}'
-        llm = ErrorThenSuccessLLM(error, success)
-        executor = RecordingExecutor()
-        confirmation = ConfirmationManager()
-
-        def request_retry(token, error_info_json, progress_cb, timeout_seconds=120):
-            progress_cb(f"__LLM_ERROR__:{token}:{error_info_json}")
-            # Do not signal anything — return timeout immediately.
-            return "timeout"
-
-        confirmation.request_retry = request_retry  # type: ignore[method-assign]
-
-        result, ctx, _ = _run_with_system(
-            llm, executor, tmp_path,
-            trace_id="r-preserved",
-            confirmation=confirmation,
-            interactive_llm_recovery=True,
-        )
-
-        assert result.startswith("❌")
-        assert llm._call_count == 1
+        assert result.startswith("❌") and "/resume" in result
+        assert llm._call_count == 1  # no in-memory continuation
         assert os.path.exists(_checkpoint_path(ctx, "r-preserved"))
+        assert not any("__LLM_ERROR__" in p for p in progress)
 
-    def test_checkpoint_enabled_false_still_retries(self, tmp_path):
-        error = httpx.TimeoutException("timed out")
-        success = '{"action": "finish", "result": "recovered"}'
-        llm = ErrorThenSuccessLLM(error, success)
-        executor = RecordingExecutor()
-        confirmation = ConfirmationManager()
-
-        def request_retry(token, error_info_json, progress_cb, timeout_seconds=120):
-            progress_cb(f"__LLM_ERROR__:{token}:{error_info_json}")
-            confirmation.signal_retry(token, "retry")
-            return "retry"
-
-        confirmation.request_retry = request_retry  # type: ignore[method-assign]
-
+    def test_checkpoint_disabled_ends_without_retry(self, tmp_path):
+        llm = ErrorThenSuccessLLM(
+            httpx.TimeoutException("timed out"), '{"action": "finish", "result": "recovered"}',
+        )
         result, ctx, _ = _run_with_system(
-            llm, executor, tmp_path,
-            trace_id="r-nocheckpt",
-            confirmation=confirmation,
-            interactive_llm_recovery=True,
+            llm, RecordingExecutor(), tmp_path,
+            trace_id="r-nocheckpt", checkpoint_recovery_eligible=True,
             checkpoint_enabled=False,
         )
-
-        assert result == "recovered"
-        assert llm._call_count == 2
+        assert result.startswith("❌") and "cannot be resumed" in result
+        assert llm._call_count == 1
         assert not os.path.exists(_checkpoint_path(ctx, "r-nocheckpt"))
+
+    def test_headless_failure_has_no_checkpoint(self, tmp_path):
+        llm = ErrorThenSuccessLLM(
+            httpx.TimeoutException("timed out"), '{"action": "finish", "result": "recovered"}',
+        )
+        result, ctx, _ = _run_with_system(
+            llm, RecordingExecutor(), tmp_path, trace_id="r-headless-x",
+        )
+        assert result.startswith("❌") and "/resume" not in result
+        assert not os.path.exists(_checkpoint_path(ctx, "r-headless-x"))
 
 
 # ---------------------------------------------------------------------------
@@ -532,49 +443,7 @@ class TestInitialStateResume:
 # ---------------------------------------------------------------------------
 
 class TestToolResultsCount:
-    """Verify the error-card tool_results_count matches json_mode tool results."""
-
-    def test_json_mode_tool_results_count_in_error_card(self, tmp_path):
-        """Tool results formatted by format_tool_result must be counted on json_mode path."""
-        from react_loop import format_tool_result
-
-        error_info = LLMErrorInfo("timeout", "⏱️ Request timed out", True, "detail")
-        success_msg = format_tool_result("tool_a", {"success": True, "output": "ok"})
-        failure_msg = format_tool_result(
-            "tool_b",
-            {"success": False, "exit_code": 1, "error": "boom"},
-        )
-        state = _LoopState(
-            messages=[
-                {"role": "user", "content": "goal"},
-                {"role": "assistant", "content": '{"action":"tool_a"}'},
-                {"role": "user", "content": success_msg},
-                {"role": "assistant", "content": '{"action":"tool_b"}'},
-                {"role": "user", "content": failure_msg},
-            ],
-            goal_idx=0,
-            max_steps=8,
-        )
-        llm = ScriptedFinishLLM()
-        ctx = _build_context(
-            tmp_path, llm, RecordingExecutor(), trace_id="r-count",
-            interactive_llm_recovery=True,
-        )
-
-        captured: list[str] = []
-
-        def request_retry(token, error_info_json, progress_cb, timeout_seconds=120):
-            captured.append(error_info_json)
-            confirmation.signal_retry(token, "retry")
-            return "retry"
-
-        confirmation = ctx.confirmation
-        confirmation.request_retry = request_retry  # type: ignore[method-assign]
-
-        assert _handle_llm_error(ctx, state, error_info, lambda _: None, "goal") is None
-        assert captured
-        payload = json.loads(captured[0])
-        assert payload["tool_results_count"] == 2
+    """Verify format_tool_result output stays recognisable as a tool result."""
 
     def test_tool_results_count_matches_format_tool_result(self):
         """format_tool_result output must trigger the count condition."""
@@ -622,7 +491,6 @@ def run_failing_preparation(tmp_path):
     owner = store.acquire_owner("r-harness1")
     assert owner is not None
     confirmation = ConfirmationManager()
-    confirmation.request_retry = lambda *args, **kwargs: "timeout"
     requests = []
 
     finish = {"choices": [{"message": {"content": '{"action":"finish","result":"done"}'}}]}
@@ -656,7 +524,7 @@ def run_failing_preparation(tmp_path):
         ctx = build_context(
             client, RecordingExecutor(),
             checkpoint_store=store, checkpoint_owner=owner, checkpoint_enabled=True,
-            confirmation=confirmation, interactive_llm_recovery=True,
+            confirmation=confirmation, checkpoint_recovery_eligible=True,
         )
         with patch("react_loop._build_system_prompt", return_value=("sys-prompt", None)):
             result = react_loop(ctx, "goal", progress_callback=lambda _m: None, initial_state=malformed)
@@ -681,9 +549,8 @@ def save_zero_outbound_checkpoint(tmp_path, trace_id="r-harness1"):
     """Persist an interactive retryable pre-send failure; return (store, owner)."""
     ctx = _build_context(
         tmp_path, ScriptedFinishLLM(), RecordingExecutor(), trace_id=trace_id,
-        interactive_llm_recovery=True,
+        checkpoint_recovery_eligible=True,
     )
-    ctx.confirmation.request_retry = lambda *args, **kwargs: "timeout"
     owner = ctx.checkpoint_store.acquire_owner(trace_id)
     ctx.checkpoint_owner = owner
     state = _LoopState(

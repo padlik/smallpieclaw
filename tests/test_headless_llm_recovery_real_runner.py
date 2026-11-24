@@ -2,10 +2,9 @@
 
 Real chain: ``AgentRuntime.create`` -> ``SubAgentRunner`` -> ``AgentController``
 -> ``react_loop`` -> real ``LLMClient`` on ``httpx.MockTransport``, with a real
-``CheckpointStore`` (writing enabled), a real ``ConfirmationManager`` and a
-positive retry timeout. Only HTTP is scripted. The retry prompt is *spied*, not
-replaced: the spy delegates to the real implementation, so a headless run that
-reached it would genuinely block for the timeout.
+``CheckpointStore`` (writing enabled) and a real ``ConfirmationManager``. Only
+HTTP is scripted. Headless runs are not checkpoint-eligible: they end terminally
+and promptly with no new checkpoint, and no live retry surface exists to wait on.
 """
 
 from __future__ import annotations
@@ -33,7 +32,7 @@ from tests.test_agent_runtime_characterization import (
 )
 from tests.inline_futures import run_inline_future
 
-RETRY_TIMEOUT_SECONDS = 20  # long enough that blocking on it is unmistakable
+PROMPT_BOUND_SECONDS = 20  # a terminal headless failure must return far sooner
 AUTOMATIC_RETRIES = 2
 PROFILES = [
     RuntimeProfile.ON_DEMAND_SUBAGENT,
@@ -82,7 +81,6 @@ class _Chain:
         self.requests: list[httpx.Request] = []
         self.clients: list[_TrackedLLM] = []
         self.runners: list = []
-        self.retry_prompts: list[str] = []
         self.respond = respond
         self.profile = profile
         self.store = _TrackedStore(str(tmp_path / "data"))
@@ -112,23 +110,13 @@ class _Chain:
         self.runner = self.build_runner(profile)
 
     def build_runner(self, profile: RuntimeProfile, **options: object):
-        """Build one real runner and wire checkpointing + a delegating retry spy."""
+        """Build one real runner and wire checkpointing (writes enabled)."""
         pin = (self.registry.admit_scheduled()
                if profile is RuntimeProfile.SCHEDULED_AGENT else self.registry.admit())
         runner = self.runtime.create(profile, RuntimeOptions(run_model=pin, **options))
         controller = runner._agent
         controller.checkpoint_store = self.store
         controller._checkpoint_enabled = True
-        controller._retry_timeout_seconds = RETRY_TIMEOUT_SECONDS
-        real_request_retry = controller._confirmation.request_retry
-
-        def spy(token, prompt_message, progress_cb, timeout_seconds=120):
-            self.retry_prompts.append(token)
-            return real_request_retry(
-                token, prompt_message, progress_cb, timeout_seconds=timeout_seconds,
-            )
-
-        controller._confirmation.request_retry = spy  # type: ignore[method-assign]
         self.runners.append(runner)
         return runner
 
@@ -201,8 +189,7 @@ def test_headless_failure_is_terminal_without_wait_token_or_checkpoint(
 
     assert result.startswith("❌") and guidance in result
     assert len(chain.requests) == sends  # exactly the existing automatic budget, no more
-    assert chain.retry_prompts == []  # the real retry wait was never entered
-    assert elapsed < RETRY_TIMEOUT_SECONDS / 2
+    assert elapsed < PROMPT_BOUND_SECONDS / 2
     assert chain.checkpoint_files() == []  # checkpointing is enabled yet nothing was written
 
 
@@ -251,7 +238,7 @@ def test_supervisor_reports_headless_llm_failure_and_cleans_up(chain_for):
     assert retrieved["success"] is False and retrieved["status"] == "failed"
     assert retrieved["error"].startswith("❌") and "exhausted" in retrieved["error"]
     assert len(chain.requests) == 1 + AUTOMATIC_RETRIES
-    assert chain.retry_prompts == [] and chain.checkpoint_files() == []
+    assert chain.checkpoint_files() == []
     (runner,) = chain.runners
     assert get_registry().get(runner.agent_id) is None  # registration released
     assert [client.close_count for client in chain.clients] == [1]  # owned client closed once
@@ -283,5 +270,5 @@ def test_plan_fails_step_once_without_replay_diagnosis_or_dependent_runs(chain_f
     assert "dependency 'a' did not succeed" in outcome["results"]["b"]["error"]
     assert len(chain.runners) == 1
     assert len(chain.requests) == 1 + AUTOMATIC_RETRIES  # one step run, no task retry or diagnosis
-    assert chain.retry_prompts == [] and chain.checkpoint_files() == []
+    assert chain.checkpoint_files() == []
     assert [client.close_count for client in chain.clients] == [1]

@@ -1259,7 +1259,6 @@ class TestNativeFallbackLinearization:
         ])
         ex = RecordingExecutor({"shell": make_outcome(output="hi")})
         confirmation = ConfirmationManager()
-        confirmation.request_retry = lambda *args, **kwargs: "timeout"
 
         result, _calls, _progress = run_react(llm, ex, "do it", confirmation=confirmation)
 
@@ -1378,10 +1377,6 @@ class TestSingleRecordLifecycle:
         llm = ScriptedLLM(['{"action":"finish","result":"done"}'])
         executor = RecordingExecutor()
 
-        class _ImmediateCancel(ConfirmationManager):
-            def request_retry(self, token, error_info_json, progress_cb, timeout_seconds=120):
-                return "cancel"
-
         events = []
         stdlib = MagicMock()
         orig_log_event = agent_logging.log_event
@@ -1400,7 +1395,7 @@ class TestSingleRecordLifecycle:
             agent_logging.log_event = mock_log_event
             with patch.object(react_loop, "logger", stdlib):
                 result, _calls, _progress = run_react(
-                    llm, executor, "do it", confirmation=_ImmediateCancel(),
+                    llm, executor, "do it", confirmation=ConfirmationManager(),
                 )
         finally:
             agent_logging.log_event = orig_log_event

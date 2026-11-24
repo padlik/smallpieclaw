@@ -96,7 +96,6 @@ class ControllerDeps:
     confirmation: ConfirmationManager = field(default_factory=ConfirmationManager)
     checkpoint_store: Optional[object] = None
     checkpoint_enabled: bool = True
-    retry_timeout_seconds: int = 120
     max_retries: int = 4
     retry_delay: float = 2.0
     context_monitor: ContextMonitor | None = None

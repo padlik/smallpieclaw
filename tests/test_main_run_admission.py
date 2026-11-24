@@ -236,7 +236,9 @@ class _Factory:
 
 
 class _World:
-    def __init__(self, tmp_path: Path, stack: ExitStack, *, history: bool = True) -> None:
+    def __init__(
+        self, tmp_path: Path, stack: ExitStack, *, history: bool = True, select: bool = True,
+    ) -> None:
         self.tmp_path = tmp_path
         self.stack = stack
         providers = {n: ProviderConfig(n, "openai", f"env:KEY_{n}", URLS[n], 9) for n in URLS}
@@ -248,7 +250,8 @@ class _World:
             )
         )
         self.registry = stores.registry(providers, _NoDiscovery(), _resolve)
-        self.registry.select(MODEL_A.id)
+        if select:
+            self.registry.select(MODEL_A.id)
         self.requests: list[httpx.Request] = []
         self.clients: list[_TrackedLLM] = []
         self.short_term = ShortTermMemory(max_turns=80)
@@ -612,27 +615,154 @@ def test_context_build_failure_closes_owned_client_and_releases(make_world, monk
     w.assert_no_events_registered()
 
 
-def test_rejected_resume_closes_owned_client_and_keeps_checkpoint(make_world, loop) -> None:
+def _resume_snapshot_counters(w: "_World", trace: str) -> dict:
+    """Saved checkpoint with a distinctive history and non-default attempt counters."""
+    messages = [
+        {"role": "user", "content": "resume goal"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call-done", "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call-done", "content": "completed tool output"},
+    ]
+    return {
+        "messages": messages,
+        "attempts": {
+            "max_retries": 3, "retry_delay": 0.0, "mode": "json", "outbound_attempts": 2,
+            "automatic_retries_used": 1, "manual_retries_used": 0,
+            "manual_retry_authorized": False, "partial_output": False, "effect": False,
+        },
+    }
+
+
+def _save_resume_checkpoint(w: "_World", trace: str, model_id: str) -> tuple[Path, dict]:
+    parts = _resume_snapshot_counters(w, trace)
+    ckpt = {
+        "format_version": 2, "trace_id": trace, "user_goal": "resume goal",
+        "messages": parts["messages"], "step": 1, "goal_idx": 0, "max_steps": 8,
+        "json_fail_streak": 0, "model_id": model_id, "attempt_state": parts["attempts"],
+        "error_info": {"type": "timeout", "message": "t", "retryable": True, "detail": ""},
+        "created_at": "2026-08-21T14:30:00Z",
+    }
+    owner = w.store.acquire_owner(trace)
+    assert owner is not None
+    try:
+        assert w.store.save(trace, ckpt, owner=owner) is True
+    finally:
+        owner.release()
+    return Path(w.store._checkpoint_dir) / f"{trace}.json", parts
+
+
+@pytest.mark.parametrize(
+    "saved_model",
+    [MODEL_A.id, MODEL_B.id, "removed-connection/gone-model"],
+    ids=["same-model", "changed-model", "removed-historical-connection"],
+)
+def test_resume_admits_the_active_model_once_and_preserves_saved_state(
+    make_world, loop, saved_model,
+) -> None:
     w = make_world()
-    factory = _Factory(w)  # admits the selected model A
-    w.controller_with(llm=None, run_client_factory=factory)
-    w.save_checkpoint("r-resume001", MODEL_B.id)
-    before = w.snapshot()
+    factory = _Factory(w)  # ordinary admission: the active selection A, never the saved model
+    controller = w.controller_with(llm=None, run_client_factory=factory)
+    path, parts = _save_resume_checkpoint(w, "r-resume001", saved_model)
+    saved_bytes = path.read_bytes()
     result, exc = _run(w, resume_from="r-resume001", trace_id=None)
-    assert exc is None and "Cannot resume" in result
-    assert len(factory.events) == 1 and loop.calls == []
+    assert exc is None and result == "loop-result"
+    assert len(factory.events) == 1 and len(factory.clients) == 1  # one admission
+    seen = loop.calls[0]
+    assert seen["llm"] is factory.clients[0]
+    assert seen["llm"].llm_cfg["id"] == MODEL_A.id  # the active model, not the historical one
+    assert seen["trace"] == "r-resume001" and seen["ctx"].trace_id == "r-resume001"
+    assert w.registry.view().active_model_id == MODEL_A.id  # preference unchanged
+    assert controller.llm is None
+    assert path.read_bytes() == saved_bytes  # snapshot immutable until a real send
     assert factory.clients[0].close_count == 1
-    assert w.snapshot() == before
     w.assert_owner_free("r-resume001")
+    w.assert_no_events_registered()
+    assert w.requests == []
+
+
+def test_resume_restores_history_and_attempt_counters_on_the_active_model(
+    make_world, monkeypatch,
+) -> None:
+    w = make_world()
+    seen: dict = {}
+
+    def capture(ctx, user_goal, progress_callback=None, images=None, **kwargs):
+        seen["state"] = kwargs["initial_state"]
+        seen["goal"] = user_goal
+        return "loop-result"
+
+    monkeypatch.setattr(agent_controller, "react_loop", capture)
+    w.controller_with(llm=None, run_client_factory=_Factory(w))
+    _, parts = _save_resume_checkpoint(w, "r-resume003", MODEL_B.id)
+    result, exc = _run(w, resume_from="r-resume003", trace_id=None)
+    assert exc is None and result == "loop-result"
+    state = seen["state"]
+    assert state.messages == parts["messages"] and seen["goal"] == "resume goal"
+    attempt = state.attempt_state
+    assert (attempt.outbound_attempts, attempt.automatic_retries_used) == (2, 1)
+    assert attempt.remaining_retries == 2  # saved budget of 3 minus 1 used: not refilled
+    assert attempt.manual_retry_authorized is True and attempt.manual_retries_used == 0
+
+
+def test_resume_without_active_selection_fails_locally_and_preserves_snapshot(
+    make_world, loop,
+) -> None:
+    w = make_world(select=False)
+    factory = _Factory(w)
+    w.controller_with(llm=None, run_client_factory=factory)
+    path, _ = _save_resume_checkpoint(w, "r-resume004", MODEL_B.id)
+    before = w.snapshot()
+    result, exc = _run(w, resume_from="r-resume004", trace_id=None)
+    assert result is None and isinstance(exc, ModelRegistryError)
+    assert exc.code == "no_active_selection"
+    assert len(factory.events) == 1 and loop.calls == [] and w.clients == []
+    assert w.requests == [] and w.snapshot() == before
+    w.assert_owner_free("r-resume004")
     w.assert_no_events_registered()
 
 
+def test_inadmissible_active_selection_fails_locally_without_send_or_mutation(
+    make_world, loop,
+) -> None:
+    w = make_world()
+    factory = _Factory(w, fail=ModelRegistryError("credential_resolution_failed"))
+    w.controller_with(llm=None, run_client_factory=factory)
+    path, _ = _save_resume_checkpoint(w, "r-resume005", MODEL_A.id)
+    before = w.snapshot()
+    result, exc = _run(w, resume_from="r-resume005", trace_id=None)
+    assert result is None and exc.code == "credential_resolution_failed"
+    assert loop.calls == [] and w.requests == [] and w.snapshot() == before
+    w.assert_owner_free("r-resume005")
 
-def test_checkpoint_resume_keeps_pinned_model_and_saved_attempts(make_world) -> None:
-    """Ordinary real-wire proof (task 2.2, from the guard suite): resuming a checkpoint
-    pinned to B while the active selection is A sends only to B, continues the saved
-    attempt state instead of refilling it, replays no completed tool, and leaves the
-    active selection, controller pin and resumable checkpoint intact."""
+
+def test_selection_changed_after_admission_does_not_retarget_the_resumed_run(
+    make_world, monkeypatch,
+) -> None:
+    w = make_world()
+    observed: dict = {}
+
+    def change_selection(ctx) -> None:
+        w.registry.select(MODEL_B.id)  # explicit /models change while the resume is running
+        observed["pin"] = ctx.llm._run_model.model.id
+
+    monkeypatch.setattr(agent_controller, "react_loop", _Loop(on_call=change_selection))
+    factory = _Factory(w)
+    w.controller_with(llm=None, run_client_factory=factory)
+    _save_resume_checkpoint(w, "r-resume006", MODEL_A.id)
+    result, exc = _run(w, resume_from="r-resume006", trace_id=None)
+    assert exc is None and result == "loop-result"
+    assert observed["pin"] == MODEL_A.id and len(factory.events) == 1
+    assert w.registry.view().active_model_id == MODEL_B.id  # only a later admission follows it
+    w.assert_owner_free("r-resume006")
+
+
+def test_checkpoint_resume_uses_active_model_and_saved_attempts(make_world) -> None:
+    """Ordinary real-wire proof: resuming a checkpoint created with B while the active
+    selection is A sends only to A, continues the saved attempt state instead of
+    refilling it, replays no completed tool, leaves the active selection and controller
+    pin unchanged and records the new model in the checkpoint saved by the failed send."""
     w = make_world()
     trace = "r-resume002"
     messages = [
@@ -669,19 +799,18 @@ def test_checkpoint_resume_keeps_pinned_model_and_saved_attempts(make_world) -> 
     w._chat = unavailable
     injected = w.make_client(w.registry.admit(MODEL_A.id))
     w.requests.clear()
-    factory = _Factory(w, model_id=MODEL_B.id)
+    factory = _Factory(w)  # ordinary admission of the active selection A
     controller = w.controller_with(llm=injected, run_client_factory=factory)
-    controller._confirmation.request_retry = lambda *_a, **_k: "timeout"
-    result, exc = _run(w, resume_from=trace, trace_id=None, interactive_llm_recovery=True)
+    result, exc = _run(w, resume_from=trace, trace_id=None, checkpoint_recovery_eligible=True)
 
-    assert exc is None and result.startswith("❌")
+    assert exc is None and result.startswith("❌") and "Use /resume to continue." in result
     assert w.registry.view().active_model_id == MODEL_A.id
     assert controller.llm is injected and injected.close_count == 0
     assert len(w.requests) == 1  # one authorized manual continuation, no refilled retries
     sent = w.requests[0]
-    assert sent.url.host == "b.example.test"
+    assert sent.url.host == "a.example.test"  # never the historical model's provider
     body = json.loads(sent.content)
-    assert body["model"] == "up/b"
+    assert body["model"] == "up/a"
     assert "completed tool output" in sent.content.decode()
     assert w.executor._supervisor.registered == w.executor._supervisor.unregistered
     owner = w.store.acquire_owner(trace)
@@ -690,7 +819,7 @@ def test_checkpoint_resume_keeps_pinned_model_and_saved_attempts(make_world) -> 
         resaved = w.store.load(trace, owner=owner)
     finally:
         owner.release()
-    assert resaved["model_id"] == MODEL_B.id
+    assert resaved["model_id"] == MODEL_A.id
     restored = CallAttemptState.from_dict(resaved["attempt_state"])
     assert (restored.outbound_attempts, restored.automatic_retries_used, restored.manual_retries_used) == (3, 1, 1)
     assert factory.clients[0].close_count == 1
@@ -714,7 +843,7 @@ def test_malformed_resumed_native_group_fails_closed_before_io(make_world) -> No
     ckpt = {
         "format_version": 2, "trace_id": trace, "user_goal": "goal", "messages": messages,
         "step": 1, "goal_idx": 0, "max_steps": 8, "json_fail_streak": 0,
-        "model_id": MODEL_B.id, "attempt_state": CallAttemptState().to_dict(),
+        "model_id": MODEL_A.id, "attempt_state": CallAttemptState().to_dict(),
         "error_info": {"type": "timeout", "message": "t", "retryable": True, "detail": ""},
         "created_at": "2026-08-21T14:30:00Z",
     }
@@ -727,9 +856,8 @@ def test_malformed_resumed_native_group_fails_closed_before_io(make_world) -> No
     saved_file = Path(w.store._checkpoint_dir) / f"{trace}.json"
     saved_bytes = saved_file.read_bytes()
     factory = _Factory(w, model_id=MODEL_B.id)
-    controller = w.controller_with(llm=None, run_client_factory=factory)
-    controller._confirmation.request_retry = lambda *_a, **_k: "timeout"  # operator boundary
-    result, exc = _run(w, resume_from=trace, trace_id=None, interactive_llm_recovery=True)
+    w.controller_with(llm=None, run_client_factory=factory)
+    result, exc = _run(w, resume_from=trace, trace_id=None, checkpoint_recovery_eligible=True)
 
     assert exc is None and result.startswith("❌")
     assert "late result" not in result and "interleaved" not in result

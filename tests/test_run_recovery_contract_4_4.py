@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from typing import Any
 
@@ -46,7 +47,6 @@ class _Harness:
         from confirmation import ConfirmationManager
 
         confirmation = ConfirmationManager()
-        confirmation.request_retry = lambda *args, **kwargs: "timeout"
         self.ctx = ReactContext(
             llm=self.client, tool_index=_NullToolIndex(), memory=_NullMemory(),
             builtin_executor=None, mcp_manager=None, skill_registry=None,
@@ -291,24 +291,48 @@ def test_resume_on_matching_pin_sends_saved_attempts_once_and_never_replays_tool
     assert restored["mode"] == "native"
 
 
-def test_resume_refuses_when_pinned_model_differs_and_sends_nothing(tmp_path, make_agent_controller):
+def test_resume_on_a_different_model_continues_on_the_admitted_pin(tmp_path, make_agent_controller):
+    """The saved model no longer gates resume: the active pin receives the saved history."""
     from unittest.mock import patch
 
     from checkpoint_store import CheckpointStore
 
-    requests: list[httpx.Request] = []
-    client = _client(
-        "openai", transport=httpx.MockTransport(lambda r: requests.append(r) or httpx.Response(200))
-    )
+    bodies: list[dict] = []
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        seen["on_disk_at_send"] = os.path.exists(snapshot_path)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": _FINISH}}], "usage": {}}
+        )
+
+    client = _client("openai", transport=httpx.MockTransport(handler))
     store = CheckpointStore(str(tmp_path))
     assert store.save("r-resume-44", _checkpoint("other-connection/other-model"))
+    snapshot_path = os.path.join(store._checkpoint_dir, "r-resume-44.json")
     controller = make_agent_controller(llm=client, checkpoint_store=store)
+
+    def run_real_loop(ctx, goal, _progress=None, _images=None, *, initial_state=None, **_kwargs):
+        from tests.execution_harness import RecordingExecutor, build_context
+
+        seen["on_disk_at_admission"] = os.path.exists(snapshot_path)
+        seen["attempt"] = initial_state.attempt_state
+        real = build_context(ctx.llm, RecordingExecutor(), trace_id=ctx.trace_id)
+        real.checkpoint_store, real.checkpoint_owner = ctx.checkpoint_store, ctx.checkpoint_owner
+        with patch("react_loop._build_system_prompt", return_value=("sys", None)):
+            return react_loop.react_loop(real, goal, initial_state=initial_state)
+
     try:
-        with patch("agent_controller.react_loop") as loop:
-            message = controller.run("ignored", resume_from="r-resume-44")
+        with patch("agent_controller.react_loop", side_effect=run_real_loop):
+            controller.run("ignored", resume_from="r-resume-44")
     finally:
         client.close()
-    assert "does not match this pinned run model" in message
-    loop.assert_not_called()
-    assert requests == []
-    assert store.load("r-resume-44") is not None
+    assert len(bodies) == 1 and bodies[0]["model"] == "upstream/model"
+    # Retirement happens at the actual send: still present after admission/restoration.
+    assert seen["on_disk_at_admission"] is True and seen["on_disk_at_send"] is False
+    attempt = seen["attempt"]
+    # Saved counters continue: 2 attempts, 1 automatic retry used, +1 manual continuation.
+    assert (attempt.outbound_attempts, attempt.automatic_retries_used) == (3, 1)
+    assert attempt.manual_retries_used == 1 and attempt.remaining_retries == 3
+    assert store.load("r-resume-44") is None  # retired by the actual send, run succeeded

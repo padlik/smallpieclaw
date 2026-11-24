@@ -128,3 +128,19 @@ def test_example_provider_credentials_stay_unresolved(tmp_path: Path) -> None:
     )
 
     assert app_config.providers["openai-main"].api_key == "sec:OPENAI_API_KEY"
+
+def test_example_documents_durable_recovery_without_the_retired_timeout(tmp_path: Path) -> None:
+    """The shipped example keeps checkpointing on and carries no active retry-timeout key."""
+    parsed = _parsed_example()
+    assert parsed["llm_error_handling"] == {"checkpoint_enabled": True}
+    app_config = parse_config(parsed, vault_file=_temp_vault(tmp_path), agent_name="piclaw")
+    assert app_config.llm_error_handling.checkpoint_enabled is True
+    text = _example_text()
+    assert "/resume" in text and "retry_timeout_seconds" in text  # only in the removal note
+
+
+def test_example_rejects_the_retired_retry_timeout_when_re_added(tmp_path: Path) -> None:
+    parsed = _parsed_example()
+    parsed["llm_error_handling"]["retry_timeout_seconds"] = 120
+    with pytest.raises(ConfigError, match="llm_error_handling.retry_timeout_seconds"):
+        parse_config(parsed, vault_file=_temp_vault(tmp_path), agent_name="piclaw")

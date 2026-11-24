@@ -902,11 +902,12 @@ def _run_with_model_services(
     from checkpoint_store import CheckpointStore, startup_checkpoint_notice
     checkpoint_store = CheckpointStore(data_dir)
     agent.checkpoint_store = checkpoint_store
+    # Operator-visible model identities (resume handoff notice) use the vault redactor.
+    agent._selector_redactor = selector_redactor
 
     # Wire LLM error handling config into the agent runtime.
     if hasattr(app_cfg, "llm_error_handling"):
         agent._checkpoint_enabled = app_cfg.llm_error_handling.checkpoint_enabled
-        agent._retry_timeout_seconds = app_cfg.llm_error_handling.retry_timeout_seconds
 
     # Wire strategy memory into the agent so the ReAct loop can query learned
     # approaches in a later iteration. Assigned post-construction to avoid
@@ -936,9 +937,9 @@ def _run_with_model_services(
             trace_id=trace_id,
             resume_from=resume_from,
             milestone_notify_fn=milestone_notify_fn,
-            # Telegram root requests and /resume are the only runs an operator
-            # can answer a Retry/Cancel card for (ADR-0048).
-            interactive_llm_recovery=True,
+            # Telegram root requests and /resume are the only runs eligible to
+            # save durable recovery checkpoints.
+            checkpoint_recovery_eligible=True,
         )
 
     # Build TelegramInterface first so notify() can reference it

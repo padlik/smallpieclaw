@@ -740,20 +740,15 @@ LLM failures are classified as `timeout`, `connection`, `rate_limit`, `empty`, `
 
 **Headless runs** (on-demand sub-agents, scheduled agents, plan steps and diagnostic agents) also return terminal failure after the existing automatic policy finishes. Notifications and sensitive-tool confirmation do not enable LLM retry cards. Failed work is not automatically replayed as a whole task.
 
-**Telegram root requests and `/resume`** explicitly enable interactive LLM recovery. For retryable failures, the agent:
+**Telegram root requests and `/resume`** are the only runs eligible for durable recovery. For a retryable failure the request ends immediately — there is no Retry/Cancel card, token or waiting period — and the agent:
 
-1. **Writes a checkpoint**, when enabled, to `data/run_checkpoints/{trace_id}.json` containing the full conversation state and pending request attempt state.
-2. **Shows an inline error card** in Telegram with:
-   - The error type and classified message
-   - Model name, current step/max-steps, and count of preserved tool results
-   - Truncated error detail (first 200 chars)
-   - **[🔄 Retry]** and **[❌ Cancel]** buttons
-3. **Waits** for up to 120 seconds (configurable) for the operator's decision:
-   - **Retry** — continues with the full conversation context without re-executing completed tools or refilling the automatic retry budget
-   - **Cancel** — retires the checkpoint under existing ownership safeguards and returns an error string
-   - **Timeout** — returns an error string but keeps the checkpoint on disk for later `/resume`
+1. **Saves a checkpoint**, when `checkpoint_enabled` is on, to `data/run_checkpoints/{trace_id}.json` containing the full conversation state, completed tool results and pending request attempt state.
+2. **Verifies the saved file** against the exact snapshot it wrote. Only then does the failure message end with "Saved progress is available. Use /resume to continue."
+3. **Returns the failure** and releases the run's resources through the normal cleanup (child draining, client close, checkpoint lease).
 
-If checkpoint saving fails, inline retry remains available, but a warning explains that disk recovery is unavailable. Returning a failure does not undo any tool effects already completed.
+If checkpoint writing is disabled or the save fails (including a disk error), the message instead ends with "Progress could not be saved for recovery. This request cannot be resumed." There is no in-memory retry any more: that failed request is lost, so send it again. Returning a failure never undoes tool effects that already completed. Cancellation always wins and creates no checkpoint.
+
+Retry/Cancel buttons on messages sent before an upgrade are inert: pressing one only answers that the buttons expired and points to `/resume`.
 
 ### `/resume` command
 
@@ -764,7 +759,15 @@ Resumes an eligible interrupted main-agent run from a saved checkpoint:
 - No eligible checkpoints — reports "No unfinished runs to resume."
 - Agent busy — reports "⚠️ Agent is currently running. Wait for it to finish or /stop it first."
 
-The controller enforces the same eligibility rule used by Telegram and startup: explicit `error_info.retryable=false` prevents resume, even for direct controller callers. Older otherwise-valid checkpoints without that flag remain eligible. Non-retryable files remain untouched on disk but are hidden from actionable lists and startup notices; no cleanup interface is added.
+The controller enforces the same eligibility rule used by Telegram and startup: explicit `error_info.retryable=false` prevents resume, even for direct controller callers. Older otherwise-valid checkpoints without that flag remain eligible. Non-retryable files remain untouched on disk but are hidden from actionable lists and startup notices.
+
+**Resume uses the currently selected model.** `/resume` admits the model selected with `/models` once, ignoring the model the checkpoint was created with (which may no longer be configured). If the two differ, a notice follows the "Resuming" line before anything is sent: "Resuming with B; saved progress was created with A. Saved conversation and tool results will be sent to the selected model's provider." No extra approval is requested, so check `/models` first when switching providers matters to you. If no model is selected or the selected one cannot be admitted, resume fails locally with guidance and the checkpoint is left as it was. Changing the selection afterwards affects only later runs.
+
+Resume restores the saved messages, completed tool results, loop position, trace and attempt counters. Completed tools are not executed again, the automatic retry budget is not refilled (an explicit resume grants one manual continuation), and nothing falls back to another model or restarts the task. This is not a promise of lossless provider conversion: saved native tool turns use the existing adapter conversion (for providers without native tool calling they are converted to a compact conversation, which can abbreviate long tool arguments), and the new provider can still reject the request because of context length, images or other restrictions. Such a rejection is reported as a normal failure.
+
+The saved file is retired only at the moment a request is actually sent. If resume fails before that (validation, admission, cancellation), the file is unchanged. If the new request fails and the failure is eligible, a fresh checkpoint is saved that records the model used for that attempt. A new checkpoint is never created from a non-retryable failure.
+
+Checkpoints you do not resume stay listed and in startup notices; the removal of the Retry/Cancel cards adds no expiry, discard command or other cleanup. The existing retention cap is unchanged: the store keeps at most 20 supported checkpoints and each new save removes the oldest ones beyond that (checkpoints in another format, unreadable files and files owned by an active run are never pruned). Remove other stale files under `data/run_checkpoints/` yourself if you no longer want them.
 
 On startup, a sole eligible checkpoint produces: "💾 Found unfinished run: '{goal}'. Send /resume to continue." With multiple eligible checkpoints, the notice names the newest eligible goal and directs the operator to `/resume`. With none, no recovery notice is sent.
 
@@ -776,11 +779,10 @@ Scheduled jobs that fail due to LLM errors are classified and reported with the 
 
 ```toml
 [llm_error_handling]
-retry_timeout_seconds = 120  # how long to wait for operator retry/cancel decision
-checkpoint_enabled = true    # whether to write disk-persisted checkpoints
+checkpoint_enabled = true    # whether new failures write a checkpoint for /resume (default true)
 ```
 
-These settings do not enable interactive recovery for headless runs. When `checkpoint_enabled = false`, eligible Telegram failures still allow in-memory Retry/Cancel, but no new disk checkpoint is written. Previously stored eligible checkpoints remain subject to normal resume validation.
+`checkpoint_enabled = false` stops new checkpoints (a failed request then reports that it cannot be resumed); checkpoints already on disk can still be resumed. The setting never makes headless runs eligible. The former `retry_timeout_seconds` key was removed together with the Retry/Cancel cards: configuration that still contains it (with any value) is rejected at startup with a message naming the key — delete the line.
 
 ### Logging
 
